@@ -185,12 +185,12 @@ ERROR_KEYWORDS = ("服务出现故障", "服务异常", "稍后再试", "公众�
 
 @dataclass
 class FetchConfig:
-    wait_after_button_click: float = 4.0
+    wait_after_button_click: float = 2.0
     wait_after_card_click: float = 10.0
     wait_before_scan: float = 2.5
     retry_count: int = 2
     retry_interval: float = 2.0
-    card_wait_timeout: float = 20.0
+    card_wait_timeout: float = 25.0
     qr_region: Optional[Tuple[int, int, int, int]] = None
     max_outer_retries: int = 5
     outer_retry_jitter: Tuple[float, float] = (5.0, 8.0)
@@ -276,47 +276,59 @@ def _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0):
 
 def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
     """
-    纯 Win32 激活，**不碰鼠标**。返回 (ok, rect_after)。
+    纯 Win32 激活，**绝不移动/缩放窗口**，也**不碰鼠标**。
+    使用 AttachThreadInput 让当前线程抢占前台队列再 SetForegroundWindow（Win32 标准 Trick）。
+    返回 (ok, rect_after)。
     """
     hwnd = win.NativeWindowHandle
-    log.info(f"[ACT] 激活 hwnd={hwnd} ...")
+    log.info(f"[ACT] activate hwnd={hwnd} ...")
 
-    # Step 1: ShowWindow(Restore), 不管当前状态
     if ctypes is not None:
         user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 关键：先把前台线程切到本线程，否则 SetForegroundWindow 会被 Windows 忽略
         try:
-            user32.ShowWindow(hwnd, 5)  # SW_SHOW only, do NOT change size
-            log.info("[ACT]   user32.ShowWindow(SW_SHOW=5) ✅")
+            foreground_hwnd = user32.GetForegroundWindow()
+            current_tid = kernel32.GetCurrentThreadId()
+            foreground_tid = user32.GetWindowThreadProcessId(foreground_hwnd, 0)
+            if current_tid != foreground_tid:
+                user32.AttachThreadInput(current_tid, foreground_tid, True)
         except Exception as e:
-            log.warning(f"[ACT]   ShowWindow ❌ {e}")
+            log.warning(f"[ACT]   AttachThreadInput prepare: {e}")
         try:
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW only — 绝不 SW_RESTORE / SW_MAXIMIZE
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
-            log.info("[ACT]   SetForegroundWindow + BringWindowToTop ✅")
+            log.info("[ACT]   ShowWindow(SW_SHOW) + SetForegroundWindow + BringWindowToTop ✅")
         except Exception as e:
-            log.warning(f"[ACT]   SetForeground/Bring ❌ {e}")
+            log.warning(f"[ACT]   ShowWindow/SetForeground fail: {e}")
+        finally:
+            # 解绑
+            try:
+                if current_tid != foreground_tid:
+                    user32.AttachThreadInput(current_tid, foreground_tid, False)
+            except Exception:
+                pass
 
-    # Step 2: uiautomation
     if auto is not None and hasattr(auto, "SW"):
         try:
             win.ShowWindow(auto.SW.Show)
         except Exception as e:
-            log.info(f"[ACT]   uiautomation.ShowWindow ❌ {e}")
+            log.info(f"[ACT]   uiautomation.ShowWindow fail: {e}")
     for fn_name, fn in [("SetActive", lambda: win.SetActive()),
                         ("SetFocus", lambda: win.SetFocus())]:
         try:
             fn()
         except Exception as e:
-            log.info(f"[ACT]   {fn_name} ❌ {e}")
+            log.info(f"[ACT]   {fn_name} fail: {e}")
 
-    # Step 3: 等 rect 稳定
     rect, dt = _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0)
     _log_all_top_windows("ACT_AFTER")
 
     if rect:
-        log.info(f"[ACT] ✅ 激活完成 rect={rect}  (耗时 {dt:.2f}s)")
+        log.info(f"[ACT] ok rect={rect} (took {dt:.2f}s)")
     else:
-        log.warning(f"[ACT] ⚠️ 激活后还是拿不到 rect")
+        log.warning("[ACT] no rect after activate")
     return rect is not None, rect
 
 
@@ -639,17 +651,48 @@ def _click_qr_button(win, button) -> bool:
 
 
 def _click_card(win, card) -> None:
-    log.info(f"[CARD_CLICK] 点卡片 ...")
+    log.info("[CARD_CLICK] clicking card ...")
     try:
         r = card.BoundingRectangle
         cx = int((r.left + r.right) / 2)
         cy = int((r.top + r.bottom) / 2)
-        log.info(f"[CARD_CLICK] rect=({r.left},{r.top},{r.right},{r.bottom}) center=({cx},{cy})")
+        rect_h = r.bottom - r.top
+        log.info(f"[CARD_CLICK] rect=({r.left},{r.top},{r.right},{r.bottom}) center=({cx},{cy}) height={rect_h}")
     except Exception as e:
-        log.warning(f"[CARD_CLICK] BoundingRectangle ❌ {e}")
+        log.warning(f"[CARD_CLICK] BoundingRectangle fail: {e}")
         return
     _save_screen("11_before_click_card")
-    _three_step_click(cx, cy, "CARD", sleep_between=2.0)
+
+    # 微信卡片经常在中间点击不生效 — 尝试 3 个候选坐标（中心、上半、下半）
+    candidates = [
+        (cx, cy, "center"),
+        (cx, cy - int(rect_h * 0.25), "upper_quarter"),
+        (cx, cy + int(rect_h * 0.25), "lower_quarter"),
+    ]
+    # 先尝试 uiautomation 的原生 Click（底层 SendInput，更准）
+    tried_uia = False
+    try:
+        if hasattr(card, "Click"):
+            log.info("[CARD_CLICK] card.Click() uia native")
+            card.Click()
+            tried_uia = True
+    except Exception as e:
+        log.warning(f"[CARD_CLICK] card.Click() fail: {e}")
+    time.sleep(0.6)
+
+    # 再补一次 pyautogui 中心单击（防止 uia 的 Click 没触发实际 UI）
+    if pyautogui is not None:
+        for tx, ty, tname in candidates:
+            try:
+                pyautogui.moveTo(tx, ty, duration=0.08)
+                time.sleep(0.1)
+                pyautogui.click(tx, ty)
+                log.info(f"[CARD_CLICK] pyautogui.click @({tx},{ty}) {tname} ok")
+                time.sleep(0.5)
+                break
+            except Exception as e:
+                log.warning(f"[CARD_CLICK] pyautogui.click @({tx},{ty}) fail: {e}")
+
     _click_control_alt(card, "CARD")
     _save_screen("12_after_click_card")
 
