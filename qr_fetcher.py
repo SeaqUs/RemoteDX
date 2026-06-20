@@ -2,11 +2,18 @@
 qr_fetcher.py - 微信自动化控制器
 完整流程：微信窗口 -> 玩家二维码按钮 -> 链接卡片 -> 内置浏览器 -> OCR取链接
 Debug 策略：外层最多跑 max_outer_retries 次完整流程，
-每次如果出现「没等到链接卡片」或「屏幕扫不到二维码」这类疑似服务器故障，
-会等 5~8 秒后再点一次 玩家二维码 按钮重新拉卡片，直到拿到链接或耗尽次数。
+每次如果出现"没等到链接卡片"或"屏幕扫不到二维码"这类疑似服务器故障，
+会等 5~8 秒后再点一次"玩家二维码"按钮重新拉卡片，直到拿到链接或耗尽次数。
+
+关键：uiautomation 依赖 COM (IUIAutomation)。Flask 后台线程里必须显式初始化 COM，
+否则会抛 [WinError -2147221008] 尚未调用 CoInitialize。
+
+二维码识别：优先用 OpenCV 的 QRCodeDetector（更稳定），退化用 pyzbar。
+截图：如果没有指定 qr_region，会自动取微信窗口区域来 OCR，速度更快且抗干扰。
 """
 import logging, io, base64, time, random
-from dataclasses import dataclass, field
+import numpy as np
+from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 
 try:
@@ -23,9 +30,19 @@ try:
 except ImportError:
     pyzbar_decode = None
 try:
-    from PIL import ImageGrab
+    from PIL import ImageGrab, Image
 except ImportError:
     ImageGrab = None
+    Image = None
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
+try:
+    import cv2
+    CV2_OK = True
+except ImportError:
+    CV2_OK = False
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("qr_fetcher")
@@ -35,9 +52,8 @@ QR_BUTTON_NAME = "玩家二维码"
 CARD_CLASSNAME = "mmui::ChatBubbleItemView"
 CARD_KEYWORD = "舞萌DX"
 
-# 关键字匹配失败卡片 / 错误提示，便于区分服务器故障 vs 普通未收到
 ERROR_KEYWORDS = ("服务出现故障", "服务异常", "稍后再试", "公众号提供的服务",
-                  "expired", "expired", "expired", "二维码已过期", "重新扫码")
+                  "二维码已过期", "重新扫码", "expired")
 
 
 @dataclass
@@ -45,15 +61,16 @@ class FetchConfig:
     wait_after_button_click: float = 2.0
     wait_after_card_click: float = 3.0
     wait_before_scan: float = 2.5
-    retry_count: int = 2               # 单次流程内找按钮/等卡片的内部重试
+    retry_count: int = 2
     retry_interval: float = 2.0
     card_wait_timeout: float = 15.0
     qr_region: Optional[Tuple[int, int, int, int]] = None
-    max_outer_retries: int = 5          # 外层完整流程最多跑几次（针对服务器故障）
-    outer_retry_jitter: Tuple[float, float] = (5.0, 8.0)  # 两次外层重试之间随机等 5~8s
+    max_outer_retries: int = 5
+    outer_retry_jitter: Tuple[float, float] = (5.0, 8.0)
 
 
 def _get_wechat_window():
+    """用 uiautomation 查找主微信窗口（ClassName 已知是 mmui::MainWindow）。"""
     if auto is None:
         log.error("uiautomation 未安装")
         return None
@@ -62,7 +79,25 @@ def _get_wechat_window():
         win.GetRuntimeId()
         return win
     except Exception as e:
-        log.warning(f"找不到微信窗口：{e}")
+        log.warning(f"按 Name=微信 没找到窗口：{e}")
+    try:
+        win = auto.WindowControl(searchDepth=1, ClassName="mmui::MainWindow")
+        win.GetRuntimeId()
+        return win
+    except Exception as e:
+        log.warning(f"按 ClassName=mmui::MainWindow 也没找到：{e}")
+    return None
+
+
+def _get_window_region(win) -> Optional[Tuple[int, int, int, int]]:
+    """拿到微信窗口的屏幕坐标（left, top, right, bottom）。"""
+    if win is None:
+        return None
+    try:
+        rect = win.BoundingRectangle
+        return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception as e:
+        log.warning(f"取窗口坐标失败：{e}")
         return None
 
 
@@ -110,10 +145,10 @@ def _click_control(ctrl) -> bool:
             cx = int((rect.left + rect.right) / 2)
             cy = int((rect.top + rect.bottom) / 2)
             pyautogui.click(cx, cy)
-            log.info(f"pyautogui 点击中心 ({cx},{cy})")
+            log.info(f"pyautogui 坐标点击 ({cx},{cy})")
             return True
         except Exception as e:
-            log.warning(f"pyautogui 坐标点击也失败：{e}")
+            log.warning(f"pyautogui 坐标点击失败：{e}")
     return False
 
 
@@ -179,21 +214,52 @@ def _screenshot(region=None):
     return pyautogui.screenshot()
 
 
-def _decode_qr_image(pil_img):
-    if pyzbar_decode is None:
-        log.error("pyzbar 没装，没法从截图识别二维码")
-        return None
-    try:
-        results = pyzbar_decode(pil_img)
-        if not results:
-            return None
-        data = results[0].data
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", errors="ignore")
-        return data
-    except Exception as e:
-        log.warning(f"pyzbar 解码失败：{e}")
-        return None
+def _pil_to_cv2(pil_img):
+    """Pillow -> OpenCV BGR。"""
+    arr = np.array(pil_img.convert("RGB"))
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def _decode_qr_image(pil_img) -> Optional[str]:
+    """从 Pillow 截图里识别二维码，优先 OpenCV QRCodeDetector，退化 pyzbar。"""
+    if CV2_OK:
+        try:
+            bgr = _pil_to_cv2(pil_img)
+            det = cv2.QRCodeDetector()
+            link, pts, straight = det.detectAndDecode(bgr)
+            if link:
+                return link
+            # 预处理：灰度+自适应阈值+增强对比度+锐化
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+            thresh = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY, 11, 2)
+            link, pts, straight = det.detectAndDecode(thresh)
+            if link:
+                log.info("cv2 预处理后识别到二维码")
+                return link
+            # 再试放大
+            h, w = gray.shape
+            big = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            link, pts, straight = det.detectAndDecode(big)
+            if link:
+                log.info("cv2 放大后识别到二维码")
+                return link
+        except Exception as e:
+            log.warning(f"cv2 解码失败：{e}")
+    if pyzbar_decode is not None:
+        try:
+            results = pyzbar_decode(pil_img)
+            if not results:
+                return None
+            data = results[0].data
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", errors="ignore")
+            return data
+        except Exception as e:
+            log.warning(f"pyzbar 解码失败：{e}")
+    log.error("cv2 和 pyzbar 都不可用，没法识别二维码")
+    return None
 
 
 def _try_find_qr_link_on_screen(region=None, attempts=3, interval=1.5):
@@ -218,8 +284,7 @@ def _save_png_base64(pil_img):
 
 
 def _detect_error_card(win) -> Optional[str]:
-    """在当前微信可见 UI 里扫有没有「服务出现故障」之类的错误提示，
-    有就返回那段文字，没有返回 None。"""
+    """在当前微信可见 UI 里扫有没有"服务出现故障"之类的错误提示。"""
     if win is None or auto is None:
         return None
     try:
@@ -241,8 +306,9 @@ def _detect_error_card(win) -> Optional[str]:
     return None
 
 
-def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
-    """跑一次完整子流程：点按钮 → 等卡片 → 点卡片 → OCR。"""
+def _single_pass(win, button, pass_index: int, cfg: FetchConfig,
+                 auto_region: Optional[Tuple[int, int, int, int]]) -> Dict:
+    """跑一次完整子流程：点按钮 -> 等卡片 -> 点卡片 -> OCR。"""
     out = {"ok": False, "link": None, "stage": f"outer_pass_{pass_index}_start",
            "card_found": False, "card_clicked": False, "error": None}
 
@@ -277,8 +343,10 @@ def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
     time.sleep(cfg.wait_after_card_click)
     time.sleep(cfg.wait_before_scan)
 
+    # 截图 region：优先显式 cfg.qr_region；没有的话自动用微信窗口框（更快、更准）
+    scan_region = cfg.qr_region or auto_region
     out["stage"] = f"outer_pass_{pass_index}_ocr"
-    link = _try_find_qr_link_on_screen(region=cfg.qr_region, attempts=4, interval=1.5)
+    link = _try_find_qr_link_on_screen(region=scan_region, attempts=4, interval=1.5)
     if link:
         out["ok"] = True
         out["link"] = link
@@ -292,22 +360,38 @@ def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
 
 def fetch_qr_code(cfg=None) -> Dict:
     """Debug 版主流程：外层最多跑 max_outer_retries 次完整子流程。
-    每次跑完把 stage 字段带上当前 pass 编号，前端可以显示「第 N / M 次尝试」。
+    关键：Flask 后台线程里必须显式初始化 COM，否则 uiautomation 会报错。
     """
     cfg = cfg or FetchConfig()
+
+    # Flask 的 threading.Thread 是一个新的 OS 线程，
+    # 不会自动 CoInitialize，uiautomation 会抛 [WinError -2147221008] 尚未调用 CoInitialize。
+    if pythoncom is not None:
+        try:
+            pythoncom.CoInitialize()
+            log.info("pythoncom.CoInitialize OK")
+        except Exception as e:
+            log.warning(f"CoInitialize failed: {e}")
+    elif auto is not None and hasattr(auto, "InitializeUIAutomationInCurrentThread"):
+        try:
+            auto.InitializeUIAutomationInCurrentThread()
+            log.info("InitializeUIAutomationInCurrentThread OK")
+        except Exception as e:
+            log.warning(f"InitializeUIAutomationInCurrentThread failed: {e}")
+
     result = {
         "ok": False, "link": None,
         "stage": "init",
         "error": None,
         "raw_png_base64": None,
-        # ---- debug 额外字段，前端 / API 可以直接展示 ----
-        "outer_attempts": cfg.max_outer_retries,       # 总共会尝试几次
-        "outer_finished": 0,                           # 实际跑了几次
-        "pass_history": [],                            # 每次 pass 的简要结果
-        "last_error_text": None,                       # 最后一次拿到的错误提示原文
-        "note": "",                                    # 给前端显示的简短提示
+        "outer_attempts": cfg.max_outer_retries,
+        "outer_finished": 0,
+        "pass_history": [],
+        "last_error_text": None,
+        "note": "",
     }
 
+    log.info("fetch_qr_code: locating WeChat window...")
     result["stage"] = "locate_window"
     win = _get_wechat_window()
     if win is None:
@@ -315,8 +399,13 @@ def fetch_qr_code(cfg=None) -> Dict:
         result["note"] = result["error"]
         return result
 
+    log.info(f"fetch_qr_code: found window Name={win.Name} ClassName={win.ClassName}")
     result["stage"] = "activate"
     _activate_window(win)
+
+    # 预取微信窗口坐标，用作默认 OCR 区域
+    auto_region = _get_window_region(win)
+    log.info(f"微信窗口区域：{auto_region}")
 
     button = None
     for i in range(cfg.retry_count + 1):
@@ -333,13 +422,12 @@ def fetch_qr_code(cfg=None) -> Dict:
         result["note"] = result["error"]
         return result
 
-    # ========== 外层重试循环 ==========
     for pass_index in range(1, cfg.max_outer_retries + 1):
         result["stage"] = f"outer_pass_{pass_index}_click_button"
         _click_control(button)
         time.sleep(0.8)
 
-        one = _single_pass(win, button, pass_index, cfg)
+        one = _single_pass(win, button, pass_index, cfg, auto_region)
         result["pass_history"].append({
             "n": pass_index,
             "ok": one["ok"],
@@ -357,7 +445,6 @@ def fetch_qr_code(cfg=None) -> Dict:
             result["note"] = f"成功获取二维码链接（第 {pass_index}/{cfg.max_outer_retries} 次尝试）"
             return result
 
-        # 还没成功 -> 准备下一次外层重试
         err_txt = one.get("error") or ""
         result["last_error_text"] = err_txt
         jitter = random.uniform(*cfg.outer_retry_jitter)
@@ -369,23 +456,22 @@ def fetch_qr_code(cfg=None) -> Dict:
             result["stage"] = f"outer_pass_{pass_index}_sleep_{int(jitter)}s"
             time.sleep(jitter)
 
-    # ========== 全部 pass 都失败 ==========
     result["stage"] = "all_retries_exhausted"
     final_reason = result["last_error_text"] or "未知原因"
     result["error"] = (
-        f"已连续尝试 {cfg.max_outer_retries} 次仍未拿到二维码卡片，"
-        f"最后一次返回：{final_reason}。"
-        f"请检查公众号是否真的返回了卡片，或稍后再点一次「玩家二维码」。"
+        "已连续尝试 %d 次仍未拿到二维码卡片。最后一次返回：%s。"
+        "请检查公众号是否真的返回了卡片，或稍后再点一次 玩家二维码。"
+        % (cfg.max_outer_retries, final_reason)
     )
     result["note"] = (
-        f"⚠️ 连续 {cfg.max_outer_retries} 次重试仍失败。"
-        f"最后一次：{final_reason}。请先手动打开微信确认公众号有没有真的发卡片，"
-        f"或检查是否有网络 / 公众号服务故障。"
+        "连续 %d 次重试仍失败。最后一次：%s。"
+        "请先手动打开微信确认公众号有没有真的发卡片，"
+        "或检查是否有网络 / 公众号服务故障。"
+        % (cfg.max_outer_retries, final_reason)
     )
 
-    # 不管怎样，留一张当前屏幕截图方便用户肉眼看看到底显示了什么
     try:
-        img = _screenshot(cfg.qr_region)
+        img = _screenshot(cfg.qr_region or auto_region)
         result["raw_png_base64"] = _save_png_base64(img)
     except Exception as e:
         log.warning(f"保存失败截图也出错：{e}")
