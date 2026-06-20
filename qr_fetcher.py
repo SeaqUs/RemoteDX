@@ -8,11 +8,17 @@ qr_fetcher.py - 微信自动化控制器
    否则 [WinError -2147221008] 尚未调用 CoInitialize。
 2) 「玩家二维码」不在聊天列表，而是底部 BizMenuView 里的 BizMenuButton。
    必须先点聊天窗口左下角 More 按钮打开这个菜单，再从里面点「玩家二维码」。
-3) 卡片点击必须走 3 步序列：pyautogui.click → pyautogui.doubleClick → uiautomation.Click()。
+3) 卡片点击必须走 3 步序列：pyautogui.click -> pyautogui.doubleClick -> uiautomation.Click()。
    只走其中任意一步，微信都不会触发内置浏览器弹窗。
 4) 二维码弹窗在微信内置浏览器浮窗，不在主窗口 BoundingRectangle 里，必须整屏截图。
+
+DEBUG 增强：
+- 每条日志同时输出到控制台 + 时间戳命名的 ./logs/qr_YYYYmmdd_HHMMSS.log
+- 关键步骤会保存一张屏幕截图到 ./logs/ 目录（L01_...png, L02_...png...）
+- 扫描 UIA 树时把命中的所有控件完整 dump 出来
+- 每一步打印精确坐标、窗口大小、当前前台窗口句柄
 """
-import logging, io, base64, time, random
+import logging, io, base64, time, random, os, sys, traceback, datetime, threading
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
@@ -44,9 +50,166 @@ try:
     CV2_OK = True
 except ImportError:
     CV2_OK = False
+try:
+    import win32gui  # pywin32
+except ImportError:
+    win32gui = None
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
+# ====== 日志系统：同时写控制台 + 时间戳文件 ======
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+_LOG_FILE = os.path.join(_LOG_DIR, f"qr_{_TS}.log")
+_FILE_HANDLER = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+_FILE_HANDLER.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+))
+_CONSOLE_HANDLER = logging.StreamHandler(sys.stdout)
+_CONSOLE_HANDLER.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+))
+logging.basicConfig(level=logging.DEBUG, handlers=[_FILE_HANDLER, _CONSOLE_HANDLER])
 log = logging.getLogger("qr_fetcher")
+
+# 全局步骤计数器 + 截图目录（让调试者知道每一步对应哪张图）
+_STEP_COUNTER = {"n": 0}
+_STEP_LOCK = threading.Lock()
+
+
+def _next_step() -> int:
+    """原子自增 step 计数器，返回新值。"""
+    with _STEP_LOCK:
+        _STEP_COUNTER["n"] += 1
+        return _STEP_COUNTER["n"]
+
+
+def _save_screen(step_label: str) -> Optional[str]:
+    """截一张全屏，保存到 logs/ 目录，返回绝对路径（失败返回 None）。"""
+    if ImageGrab is None:
+        return None
+    step = _next_step()
+    safe_label = step_label.replace(" ", "_").replace("/", "_")
+    out_path = os.path.join(_LOG_DIR, f"L{step:02d}_{safe_label}_{_TS}.png")
+    try:
+        img = ImageGrab.grab()
+        img.save(out_path)
+        log.info(f"📸 截图 step#{step} 保存 => {out_path}  大小={os.path.getsize(out_path)}  尺寸={img.size}")
+        return out_path
+    except Exception as e:
+        log.warning(f"📸 截图 step#{step} 失败：{e}")
+        return None
+
+
+def _dump_all_top_windows() -> List[Tuple[int, str, str, int, int, int, int]]:
+    """列出当前系统所有可见顶层窗口 (hwnd, title, class, L,T,R,B)。"""
+    if win32gui is None:
+        return []
+    wins = []
+    def _cb(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            cls = win32gui.GetClassName(hwnd)
+            if title or cls:
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                wins.append((hwnd, title, cls, l, t, r, b))
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        log.warning(f"EnumWindows 异常：{e}")
+    return wins
+
+
+def _log_all_top_windows(prefix: str = "TOP_WINS"):
+    """把当前可见顶层窗口全部打印出来，便于发现微信是否被遮挡/最小化。"""
+    wins = _dump_all_top_windows()
+    wins.sort(key=lambda w: w[3])  # 按 left 排序
+    log.debug(f"=== {prefix} 共 {len(wins)} 个可见顶层窗口 ===")
+    for hwnd, title, cls, l, t, r, b in wins:
+        width = r - l
+        height = b - t
+        visible_tag = "  MINIMIZED" if width <= 0 or height <= 0 else ""
+        log.debug(f"  hwnd={hwnd:>8} cls={cls:<40} title={title[:40]:<40} rect=({l},{t},{r},{b}) size={width}x{height}{visible_tag}")
+
+
+def _dump_uia_tree(node, depth: int, max_depth: int = 6, lines: List[str] = None):
+    """
+    打印 UIA 树的一部分（最多 max_depth 层）。
+    对每个节点，把 Name / ClassName / ControlType / BoundingRectangle 都打出来。
+    """
+    if lines is None:
+        lines = []
+    if depth > max_depth:
+        return lines
+    indent = "  " * depth
+    try:
+        name = getattr(node, "Name", None) or ""
+        cls = getattr(node, "ClassName", None) or ""
+        ctrl_type = getattr(node, "ControlType", None)
+        try:
+            ctrl_type_name = ctrl_type.Name if ctrl_type is not None else ""
+        except Exception:
+            ctrl_type_name = str(ctrl_type) if ctrl_type is not None else ""
+        rect = None
+        try:
+            r = node.BoundingRectangle
+            rect = f"({r.left},{r.top},{r.right},{r.bottom})"
+        except Exception:
+            rect = "?"
+        txt = f"{indent}⌜Name={name[:40]:<40} ClassName={cls:<45} Type={ctrl_type_name:<20} Rect={rect}"
+        lines.append(txt)
+        children = node.GetChildren()
+        for c in children:
+            _dump_uia_tree(c, depth + 1, max_depth, lines)
+    except Exception as e:
+        lines.append(f"{indent}!ERROR: {e}")
+    return lines
+
+
+def _log_wechat_subtree(win, prefix: str = "WECHAT_TREE"):
+    """dump 微信窗口下前 6 层 UIA 树，只在 debug 级别打。"""
+    try:
+        lines = _dump_uia_tree(win, 0, max_depth=6)
+        log.debug(f"=== {prefix} 共 {len(lines)} 行 (前 200 行) ===")
+        for line in lines[:200]:
+            log.debug(line)
+        if len(lines) > 200:
+            log.debug(f"... (剩余 {len(lines) - 200} 行略，请到 {_LOG_FILE} 查看完整)")
+    except Exception as e:
+        log.warning(f"dump UIA 树失败：{e}")
+
+
+def _log_all_class_names(win, keyword: str = ""):
+    """扫 UIA 树，把所有 ClassName 含 keyword 的节点都列出来（含坐标）。"""
+    all_nodes = _walk_controls(win, 40)
+    seen = {}
+    for c in all_nodes:
+        try:
+            cls = getattr(c, "ClassName", "") or ""
+            if keyword and keyword not in cls:
+                continue
+            nm = getattr(c, "Name", "") or ""
+            try:
+                r = c.BoundingRectangle
+                rect = f"({r.left},{r.top},{r.right},{r.bottom})"
+            except Exception:
+                rect = "?"
+            key = cls
+            if key not in seen:
+                seen[key] = []
+            if len(seen[key]) < 30:
+                seen[key].append((nm[:60], rect))
+        except Exception:
+            continue
+    log.info(f"=== ClassName 包含 '{keyword}' 的节点（最多每种 30 个） ===")
+    for cls, items in sorted(seen.items()):
+        log.info(f"  [{cls}]  count={len(items)}/...")
+        for nm, rect in items:
+            log.info(f"    Name={nm:<60} Rect={rect}")
+
+
+# ====== 以下基本功能函数都加上详细日志 ======
 
 WECHAT_WINDOW_NAME = "微信"
 QR_BUTTON_NAME = "玩家二维码"
@@ -59,8 +222,8 @@ ERROR_KEYWORDS = ("服务出现故障", "服务异常", "稍后再试", "公众�
 
 @dataclass
 class FetchConfig:
-    wait_after_button_click: float = 4.0       # 玩家二维码 按钮点开后，服务器发卡片大约需要 3~6 秒
-    wait_after_card_click: float = 10.0        # 卡片点开后，微信内置浏览器加载二维码约 5~10 秒
+    wait_after_button_click: float = 4.0
+    wait_after_card_click: float = 10.0
     wait_before_scan: float = 2.5
     retry_count: int = 2
     retry_interval: float = 2.0
@@ -68,102 +231,135 @@ class FetchConfig:
     qr_region: Optional[Tuple[int, int, int, int]] = None
     max_outer_retries: int = 5
     outer_retry_jitter: Tuple[float, float] = (5.0, 8.0)
-    more_button_offset: Tuple[int, int] = (27, 1407)  # 聊天窗口左下角 More 按钮位置（相对窗口左上角）
+    more_button_offset: Tuple[int, int] = (27, 1407)
 
 
 def _co_init():
     """在当前 OS 线程里初始化 COM（Flask 后台线程必须调用，否则 uiautomation 报 CoInitialize 未调用）。"""
+    tid = threading.current_thread().ident
+    log.info(f"[COM] 当前线程 id={tid} 开始 CoInitialize...")
+    ok = False
     if pythoncom is not None:
         try:
             pythoncom.CoInitialize()
-            log.info("pythoncom.CoInitialize OK")
-            return True
+            log.info("[COM] pythoncom.CoInitialize ✅")
+            ok = True
         except Exception as e:
-            log.warning(f"pythoncom.CoInitialize failed: {e}")
-    if auto is not None and hasattr(auto, "InitializeUIAutomationInCurrentThread"):
+            log.warning(f"[COM] pythoncom.CoInitialize ❌ {type(e).__name__}: {e}")
+    if not ok and auto is not None and hasattr(auto, "InitializeUIAutomationInCurrentThread"):
         try:
             auto.InitializeUIAutomationInCurrentThread()
-            log.info("InitializeUIAutomationInCurrentThread OK")
-            return True
+            log.info("[COM] InitializeUIAutomationInCurrentThread ✅")
+            ok = True
         except Exception as e:
-            log.warning(f"InitializeUIAutomationInCurrentThread failed: {e}")
-    return False
+            log.warning(f"[COM] InitializeUIAutomationInCurrentThread ❌ {type(e).__name__}: {e}")
+    if not ok:
+        log.error("[COM] 所有 CoInitialize 策略都失败！uiautomation 大概率没法用。")
+    return ok
 
 
 def _get_wechat_window():
-    """用 uiautomation 查找主微信窗口（ClassName 已知是 mmui::MainWindow）。"""
+    """用 uiautomation 查找主微信窗口。"""
+    _log_all_top_windows("SEARCH_WIN_PRE")
     if auto is None:
         log.error("uiautomation 未安装")
         return None
+    log.info("[WIN] 按 Name='微信' 查窗口...")
     try:
         win = auto.WindowControl(searchDepth=1, Name=WECHAT_WINDOW_NAME)
         win.GetRuntimeId()
+        log.info(f"[WIN] ✅ 按 Name 找到: Name={win.Name} ClassName={win.ClassName} Handle={win.NativeWindowHandle}")
         return win
     except Exception as e:
-        log.warning(f"按 Name=微信 没找到窗口：{e}")
+        log.info(f"[WIN] 按 Name 没找到：{type(e).__name__}: {e}")
+    log.info("[WIN] 按 ClassName='mmui::MainWindow' 查窗口...")
     try:
         win = auto.WindowControl(searchDepth=1, ClassName="mmui::MainWindow")
         win.GetRuntimeId()
+        log.info(f"[WIN] ✅ 按 ClassName 找到: Name={win.Name} ClassName={win.ClassName} Handle={win.NativeWindowHandle}")
         return win
     except Exception as e:
-        log.warning(f"按 ClassName=mmui::MainWindow 也没找到：{e}")
+        log.info(f"[WIN] 按 ClassName 没找到：{type(e).__name__}: {e}")
+    _log_all_top_windows("SEARCH_WIN_POST")
     return None
 
 
 def _get_window_region(win) -> Optional[Tuple[int, int, int, int]]:
-    """拿到微信窗口的屏幕坐标（left, top, right, bottom）。"""
     if win is None:
         return None
     try:
         rect = win.BoundingRectangle
-        return (rect.left, rect.top, rect.right, rect.bottom)
+        r = (rect.left, rect.top, rect.right, rect.bottom)
+        log.info(f"[WIN] 微信窗口 rect={r}  size=({rect.right - rect.left}x{rect.bottom - rect.top})")
+        return r
     except Exception as e:
-        log.warning(f"取窗口坐标失败：{e}")
+        log.warning(f"[WIN] 取窗口坐标失败：{e}")
         return None
 
 
 def _activate_window(win) -> bool:
-    """
-    把微信窗口真正打到前台：uiautomation.ShowWindow + Win32 ShowWindow(Restore)+SetForeground+BringWindowToTop。
-    实测只调用 uiautomation.SetActive() 微信不会收到键盘/鼠标消息。
-    """
+    """把微信窗口真正打到前台。"""
+    log.info(f"[ACT] 开始激活窗口 Handle={win.NativeWindowHandle} ...")
+    ok = False
     try:
+        # 1) uiautomation ShowWindow
         if auto is not None and hasattr(auto, "SW"):
-            try:
-                win.ShowWindow(auto.SW.Restore)
-            except Exception:
-                pass
-            try:
-                win.ShowWindow(auto.SW.Show)
-            except Exception:
-                pass
+            for sw_name, sw_val in [("Restore", auto.SW.Restore), ("Show", auto.SW.Show)]:
+                try:
+                    win.ShowWindow(sw_val)
+                    log.info(f"[ACT]   uiautomation.ShowWindow({sw_name}={sw_val}) ✅")
+                except Exception as e:
+                    log.warning(f"[ACT]   ShowWindow({sw_name}) ❌ {e}")
+        # 2) Win32 ShowWindow / SetForeground / BringWindowToTop
         if ctypes is not None:
             user32 = ctypes.windll.user32
-            try:
-                hwnd = win.NativeWindowHandle
-                if hwnd:
-                    user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+            hwnd = win.NativeWindowHandle
+            log.info(f"[ACT]   Win32 hwnd={hwnd}")
+            if hwnd:
+                try:
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE=9
+                    log.info("[ACT]   user32.ShowWindow(hwnd, 9) ✅")
+                except Exception as e:
+                    log.warning(f"[ACT]   user32.ShowWindow ❌ {e}")
+                try:
                     user32.SetForegroundWindow(hwnd)
+                    log.info("[ACT]   user32.SetForegroundWindow ✅")
+                except Exception as e:
+                    log.warning(f"[ACT]   user32.SetForegroundWindow ❌ {e}")
+                try:
                     user32.BringWindowToTop(hwnd)
-            except Exception:
-                pass
-        try:
-            win.SetActive()
-        except Exception:
-            pass
-        try:
-            win.SetFocus()
-        except Exception:
-            pass
+                    log.info("[ACT]   user32.BringWindowToTop ✅")
+                except Exception as e:
+                    log.warning(f"[ACT]   user32.BringWindowToTop ❌ {e}")
+        # 3) uiautomation SetActive / SetFocus
+        for fn_name, fn in [("SetActive", lambda: win.SetActive()),
+                            ("SetFocus", lambda: win.SetFocus())]:
+            try:
+                fn()
+                log.info(f"[ACT]   win.{fn_name}() ✅")
+            except Exception as e:
+                log.warning(f"[ACT]   win.{fn_name}() ❌ {e}")
+        ok = True
         time.sleep(0.6)
-        return True
+        # 4) 看一下激活后的顶层窗口列表，确认微信是否真在最前
+        _log_all_top_windows("ACT_AFTER")
+        # 5) pyautogui 也挪一下鼠标到微信中心（有的窗口 SetForeground 了但不响应）
+        if pyautogui is not None:
+            try:
+                r = win.BoundingRectangle
+                cx = (r.left + r.right) // 2
+                cy = (r.top + r.bottom) // 2
+                pyautogui.moveTo(cx, cy, duration=0.1)
+                log.info(f"[ACT]   pyautogui.moveTo 微信中心 ({cx},{cy}) ✅")
+            except Exception as e:
+                log.warning(f"[ACT]   pyautogui.moveTo ❌ {e}")
     except Exception as e:
-        log.warning(f"激活窗口失败：{e}")
-        return False
+        log.warning(f"[ACT] 激活窗口整体异常：{type(e).__name__}: {e}")
+        traceback.print_exc()
+    return ok
 
 
 def _walk_controls(node, max_depth: int) -> list:
-    """BFS/DFS 遍历 UIA 控件树。"""
     result = []
     if max_depth <= 0:
         return result
@@ -177,170 +373,227 @@ def _walk_controls(node, max_depth: int) -> list:
     return result
 
 
-def _click_control(ctrl) -> bool:
-    """兜底点击：先走 Invoke Pattern，再走 uiautomation.Click，最后才 pyautogui 坐标点击。"""
+def _click_control(ctrl, label: str = "ctrl") -> bool:
+    """兜底点击（逐策略打日志）。"""
+    log.info(f"[CLICK_{label}] begin")
     if auto is not None:
         try:
             ctrl.GetInvokePattern().Invoke()
-            log.info("Invoke Pattern 点击成功")
-            return True
-        except Exception:
-            pass
-        try:
-            ctrl.Click()
-            log.info(".Click() 点击成功")
+            log.info(f"[CLICK_{label}]   InvokePattern ✅")
             return True
         except Exception as e:
-            log.warning(f"uiautomation 点击失败：{e}")
+            log.info(f"[CLICK_{label}]   InvokePattern ❌ {type(e).__name__}: {str(e)[:80]}")
+        try:
+            ctrl.Click()
+            log.info(f"[CLICK_{label}]   .Click() ✅")
+            return True
+        except Exception as e:
+            log.info(f"[CLICK_{label}]   .Click() ❌ {type(e).__name__}: {str(e)[:80]}")
     if pyautogui is not None:
         try:
             rect = ctrl.BoundingRectangle
             cx = int((rect.left + rect.right) / 2)
             cy = int((rect.top + rect.bottom) / 2)
+            log.info(f"[CLICK_{label}]   pyautogui.click ({cx},{cy}) rect=({rect.left},{rect.top},{rect.right},{rect.bottom})")
             pyautogui.click(cx, cy)
-            log.info(f"pyautogui 坐标点击 ({cx},{cy})")
             return True
         except Exception as e:
-            log.warning(f"pyautogui 坐标点击失败：{e}")
+            log.warning(f"[CLICK_{label}]   pyautogui.click ❌ {e}")
     return False
 
 
 def _ensure_biz_menu_view(win, win_region: Tuple[int, int, int, int], cfg: FetchConfig):
-    """
-    找到/打开底部 BizMenuView（包含 我的记录 / 玩家二维码 / 资讯 的菜单）。
-    这个菜单默认关闭，需要点聊天窗口左下角 More 按钮才能展开。
-    """
-    # 先尝试直接在控件树里找到（可能已经展开了）
-    for c in _walk_controls(win, 20):
+    """找到/打开底部 BizMenuView。"""
+    log.info(f"[BIZ] 检查 BizMenuView 是否可见 ...")
+    _log_all_class_names(win, keyword="BizMenu")
+    _save_screen("01_before_biz_menu")
+
+    # 1) 先直接扫 UIA 树
+    biz_found = False
+    all_nodes = _walk_controls(win, 25)
+    for c in all_nodes:
         try:
             if "BizMenuView" in (getattr(c, "ClassName", "") or ""):
-                log.info("底部菜单 BizMenuView 已可见")
-                return True
+                nm = getattr(c, "Name", "") or ""
+                r = c.BoundingRectangle
+                log.info(f"[BIZ] ✅ BizMenuView 已可见：Name='{nm}' ClassName={c.ClassName} rect=({r.left},{r.top},{r.right},{r.bottom})")
+                biz_found = True
+                break
         except Exception:
             continue
+    if biz_found:
+        _save_screen("02_biz_menu_already_visible")
+        return True
 
-    # 没找到 -> 点左下角 More 按钮把它展开
+    # 2) 点左下角 More
     left, top, _, bottom = win_region
     mx = left + cfg.more_button_offset[0]
     my = top + cfg.more_button_offset[1]
-    log.info(f"底部菜单未展开，点 More 按钮 @({mx},{my})")
-    _activate_window(win); time.sleep(0.3)
+    log.info(f"[BIZ] BizMenuView 不可见，点 More 按钮 @({mx},{my}) offset={cfg.more_button_offset}")
+    _activate_window(win)
+    time.sleep(0.3)
     if pyautogui is not None:
-        pyautogui.click(mx, my)
+        try:
+            pyautogui.click(mx, my)
+            log.info("[BIZ]   pyautogui.click(More) ✅")
+        except Exception as e:
+            log.warning(f"[BIZ]   pyautogui.click(More) ❌ {e}")
     time.sleep(3.0)
+    _save_screen("03_after_click_more")
 
-    # 再次扫描
-    for c in _walk_controls(win, 20):
+    # 3) 再扫一次
+    all_nodes = _walk_controls(win, 25)
+    for c in all_nodes:
         try:
             if "BizMenuView" in (getattr(c, "ClassName", "") or ""):
-                log.info("展开后 BizMenuView 找到")
+                nm = getattr(c, "Name", "") or ""
+                r = c.BoundingRectangle
+                log.info(f"[BIZ] ✅ 展开后 BizMenuView 出现：Name='{nm}' ClassName={c.ClassName} rect=({r.left},{r.top},{r.right},{r.bottom})")
+                _save_screen("04_biz_menu_opened")
                 return True
         except Exception:
             continue
-    log.warning("点了 More 但没扫描到 BizMenuView")
+
+    log.warning("[BIZ] ❌ 点了 More 但 UIA 树里还是没有 BizMenuView！")
+    _log_wechat_subtree(win, prefix="WECHAT_TREE_NO_BIZMENU")
+    _save_screen("05_no_biz_menu_after_more")
     return False
 
 
 def _find_qr_button(win, require_biz_menu: bool = True):
-    """
-    定位「玩家二维码」按钮。
-    - require_biz_menu=True：限定必须是 BizMenuView 下的 BizMenuButton（底部菜单里那个）。
-      原因：聊天列表里也可能出现玩家二维码 文本（但那是之前的卡片，不是按钮）。
-    """
-    if win is None:
-        return None
+    """定位「玩家二维码」按钮。"""
+    log.info(f"[BTN] 寻找 玩家二维码 按钮 (require_biz_menu={require_biz_menu}) ...")
+    all_nodes = _walk_controls(win, 40)
+    log.info(f"[BTN] UIA 树共遍历到 {len(all_nodes)} 个节点")
 
-    all_nodes = _walk_controls(win, 30)
-
-    # 先扫 BizMenuView 的直接子节点（最快，且避免和聊天列表里旧卡片混淆）
-    for c in all_nodes:
-        try:
-            cls = getattr(c, "ClassName", "") or ""
-            if "BizMenuView" in cls:
-                for sub in _walk_controls(c, 10):
+    # 1) 先 BizMenuView 下找（最准）
+    if require_biz_menu:
+        for c in all_nodes:
+            try:
+                if "BizMenuView" not in (getattr(c, "ClassName", "") or ""):
+                    continue
+                for sub in _walk_controls(c, 15):
                     try:
                         nm = getattr(sub, "Name", "") or ""
                         sc = getattr(sub, "ClassName", "") or ""
-                        if nm == QR_BUTTON_NAME and "BizMenuButton" in sc:
-                            log.info(f"BizMenuView 内找到 玩家二维码 按钮，ClassName={sc}")
+                        if nm == QR_BUTTON_NAME:
+                            r = sub.BoundingRectangle
+                            log.info(f"[BTN] ✅ BizMenuView 内找到 玩家二维码：ClassName={sc} rect=({r.left},{r.top},{r.right},{r.bottom})")
+                            if "BizMenuButton" in sc or "XButton" in sc or "Button" in sc:
+                                return sub
+                            log.info(f"[BTN]   但 ClassName={sc} 看起来不像按钮（先当作按钮用）")
                             return sub
                     except Exception:
                         continue
-        except Exception:
-            continue
+            except Exception:
+                continue
 
-    # 兜底：全树扫 Name+Class 组合
+    # 2) 兜底：全树扫 Name+Class 组合
+    log.info("[BTN] BizMenuView 下没找到，兜底全树扫 ...")
+    candidates = []
     for c in all_nodes:
         try:
             nm = getattr(c, "Name", "") or ""
             sc = getattr(c, "ClassName", "") or ""
-            if nm == QR_BUTTON_NAME and ("BizMenuButton" in sc or "XButton" in sc):
-                log.info(f"全局找到 玩家二维码 按钮 ClassName={sc}")
-                return c
+            if nm == QR_BUTTON_NAME:
+                r = None
+                try:
+                    r = c.BoundingRectangle
+                except Exception:
+                    pass
+                log.info(f"[BTN] 兜底扫到 玩家二维码：ClassName={sc} rect={r} type={type(c).__name__}")
+                candidates.append(c)
         except Exception:
             continue
+    if candidates:
+        # 优先 ClassName 含 Button 的
+        def _score(c):
+            sc = getattr(c, "ClassName", "") or ""
+            return 0 if ("Button" in sc or "XButton" in sc) else 1
+        candidates.sort(key=_score)
+        log.info(f"[BTN] ✅ 兜底选最像按钮的那个（共 {len(candidates)} 个候选）")
+        return candidates[0]
 
-    log.warning("没定位到 玩家二维码 按钮")
+    log.warning("[BTN] ❌ 整个 UIA 树都没找到 玩家二维码 按钮")
+    _log_all_class_names(win, keyword="")  # 全量 dump，方便看到所有 ClassName
+    _save_screen("06_no_qr_button_found")
     return None
 
 
 def _find_latest_qr_card(win, timeout=15.0):
-    """在消息列表里找最新的舞萌DX 二维码卡片（取 y 最大即最靠下那条）。"""
-    if win is None:
-        return None
+    """在消息列表里找最新的舞萌DX二维码卡片。"""
+    log.info(f"[CARD] 开始找最新二维码卡片，timeout={timeout}s (ClassName={CARD_CLASSNAME}, keyword={CARD_KEYWORD})")
     deadline = time.time() + timeout
+    attempt = 0
     while time.time() < deadline:
+        attempt += 1
         candidates = []
-        all_nodes = _walk_controls(win, 30)
+        all_nodes = _walk_controls(win, 40)
         for c in all_nodes:
             try:
                 cn = getattr(c, "ClassName", "") or ""
                 nm = getattr(c, "Name", "") or ""
                 if CARD_CLASSNAME in cn and CARD_KEYWORD in str(nm):
-                    candidates.append(c)
+                    r = None
+                    try:
+                        r = c.BoundingRectangle
+                    except Exception:
+                        pass
+                    candidates.append((c, r))
             except Exception:
                 continue
         if candidates:
-            latest = max(candidates,
-                         key=lambda c: (getattr(getattr(c, "BoundingRectangle", None),
-                                                 "bottom", None) or 0))
-            log.info(f"找到链接卡片：Name={latest.Name[:80]}")
-            return latest
-        log.info(f"还没看到链接卡片，1s 后再找 (剩余 {int(deadline - time.time())}s)")
+            # bottom 最大即最靠下最新
+            latest = max(candidates, key=lambda t: (t[1].bottom if t[1] else 0))
+            c, r = latest
+            log.info(f"[CARD] ✅ 找到 {len(candidates)} 张候选，最新一张：Name={getattr(c,'Name','')[:80]} rect=({r.left},{r.top},{r.right},{r.bottom})")
+            # 把其他候选也记一下
+            for ci, ri in candidates:
+                log.info(f"[CARD]   候选：Name={getattr(ci,'Name','')[:60]} rect=({ri.left},{ri.top},{ri.right},{ri.bottom})")
+            return c
+        left = int(deadline - time.time())
+        if attempt % 3 == 0 or left <= 3:
+            log.info(f"[CARD] 第 {attempt} 次扫描，仍无卡片（剩余 {left}s）")
+            # 每 3 次 dump 一次微信 UIA 树（只前 4 层），看聊天列表到底长什么样
+            if attempt % 6 == 0:
+                _log_wechat_subtree(win, prefix=f"CARD_WAIT_ATTEMPT_{attempt}")
+                _log_all_class_names(win, keyword="Chat")
         time.sleep(1)
-    log.warning(f"等了 {timeout}s 还是没找到链接卡片")
+    log.warning(f"[CARD] ❌ 等了 {timeout}s 都没找到任何 {CARD_CLASSNAME} 含 '{CARD_KEYWORD}' 的卡片")
+    _log_wechat_subtree(win, prefix="CARD_TIMEOUT_TREE")
+    _log_all_class_names(win, keyword="Chat")
+    _log_all_class_names(win, keyword="mmui")
+    _save_screen("07_no_card_after_timeout")
     return None
 
 
-def _screenshot(region=None):
-    """截屏幕；region 是 (L,T,R,B) 像素坐标；不传则截全屏。"""
+def _screenshot(region=None, label: str = "shot"):
     if ImageGrab is None and pyautogui is None:
         raise RuntimeError("Pillow 或 pyautogui 至少得装一个才能截图")
+    t0 = time.time()
     if ImageGrab is not None:
-        return ImageGrab.grab(bbox=region) if region else ImageGrab.grab()
-    if region:
+        img = ImageGrab.grab(bbox=region) if region else ImageGrab.grab()
+    else:
         left, top, right, bottom = region
-        return pyautogui.screenshot(region=(left, top, right - left, bottom - top))
-    return pyautogui.screenshot()
+        img = pyautogui.screenshot(region=(left, top, right - left, bottom - top))
+    dt = time.time() - t0
+    log.info(f"[SCREEN] {label} region={region} size={img.size} 用时={dt:.2f}s")
+    return img
 
 
 def _pil_to_cv2(pil_img):
-    """Pillow -> OpenCV BGR。"""
     arr = np.array(pil_img.convert("RGB"))
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def _decode_qr_image(pil_img) -> Optional[str]:
+def _decode_qr_image(pil_img) -> Tuple[Optional[str], Optional[str]]:
     """
-    多策略 OpenCV QRCodeDetector：
-    - 原始 BGR
-    - 灰度
-    - CLAHE + adaptiveThreshold
-    - 2x/4x 放大
+    OpenCV QRCodeDetector 多策略。返回 (link, hit_label)。
+    全部失败返回 (None, None)。
     """
     if not CV2_OK:
-        return None
-
+        log.warning("[QR] cv2 不可用，没法识别")
+        return None, None
     try:
         bgr = _pil_to_cv2(pil_img)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -348,39 +601,49 @@ def _decode_qr_image(pil_img) -> Optional[str]:
         thresh = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY, 11, 2)
         det = cv2.QRCodeDetector()
-
-        for img, label in [
-            (bgr, "bgr"), (gray, "gray"), (thresh, "thresh"), (clahe, "clahe"),
-        ]:
-            link, _, _ = det.detectAndDecode(img)
-            if link:
-                log.info(f"cv2[{label}] 识别到二维码：{link[:80]}")
-                return link
-
-        h, w = gray.shape
-        for scale in [2, 3, 4, 6, 8]:
+        strategies = [
+            (bgr,                   "bgr"),
+            (gray,                  "gray"),
+            (clahe,                 "clahe"),
+            (thresh,                "thresh"),
+        ]
+        for scale in [2, 3, 4, 6, 8, 10, 12]:
+            h, w = gray.shape
             big = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-            link, _, _ = det.detectAndDecode(big)
+            strategies.append((big, f"gray x{scale}"))
+
+        total = len(strategies)
+        for idx, (img, label) in enumerate(strategies, 1):
+            try:
+                link, pts, straight = det.detectAndDecode(img)
+            except Exception as e:
+                log.info(f"[QR]   [{idx}/{total}] {label} detectAndDecode ❌ {e}")
+                continue
             if link:
-                log.info(f"cv2[gray x{scale}] 识别到二维码：{link[:80]}")
-                return link
+                log.info(f"[QR]   ✅ [{idx}/{total}] {label} => {link}")
+                return link, label
+            log.debug(f"[QR]   [{idx}/{total}] {label} => (empty)")
+        log.info(f"[QR] ❌ 全部 {total} 种策略都没识别到二维码")
     except Exception as e:
-        log.warning(f"cv2 解码失败：{e}")
-    return None
+        log.warning(f"[QR] ❌ cv2 解码整体异常：{type(e).__name__}: {e}")
+        traceback.print_exc()
+    return None, None
 
 
 def _try_find_qr_link_on_screen(attempts=6, interval=2.0):
-    """整屏截图+解码，最多 attempts 次。"""
+    """整屏截图+解码。"""
+    log.info(f"[QR] 开始循环截图+解码 attempts={attempts} interval={interval}s")
     for i in range(attempts):
-        log.info(f"二维码识别尝试 {i+1}/{attempts} ...")
+        log.info(f"[QR] --- 尝试 {i+1}/{attempts} ---")
         try:
-            img = _screenshot(None)
-            link = _decode_qr_image(img)
+            img = _screenshot(None, label=f"qr_attempt_{i+1}")
+            link, hit_label = _decode_qr_image(img)
             if link:
-                log.info(f"识别到链接：{link[:120]}")
+                log.info(f"[QR] ✅ 第 {i+1} 次识别成功！策略={hit_label}  link={link}")
+                _save_screen(f"08_QR_OK_attempt{i+1}")
                 return link
         except Exception as e:
-            log.warning(f"截图/解码异常：{e}")
+            log.warning(f"[QR] 截图/解码异常：{e}")
         time.sleep(interval)
     return None
 
@@ -392,7 +655,6 @@ def _save_png_base64(pil_img):
 
 
 def _detect_error_card(win) -> Optional[str]:
-    """在当前微信可见 UI 里扫有没有「服务出现故障」之类的错误提示。"""
     if win is None or auto is None:
         return None
     try:
@@ -405,79 +667,98 @@ def _detect_error_card(win) -> Optional[str]:
                 low = nm.lower()
                 for kw in ERROR_KEYWORDS:
                     if kw.lower() in low:
-                        log.warning(f"疑似错误提示：{nm[:120]}")
+                        log.warning(f"[ERR] 疑似错误提示：{nm[:200]}")
                         return nm
             except Exception:
                 continue
     except Exception as e:
-        log.warning(f"扫错误卡片时 UIA 抛异常：{e}")
+        log.warning(f"[ERR] 扫错误卡片时异常：{e}")
     return None
 
 
-def _three_step_click_center(cx, cy, sleep_between=2.0):
-    """
-    实测唯一能让微信弹出内置浏览器的点击序列：
-    1) pyautogui.click  ← 产生 WM_LBUTTONDOWN/UP
-    2) pyautogui.doubleClick ← 覆盖只对双击响应的控件
-    3) uiautomation.Click() ← 触发 InvokePattern / 内部事件
-    中间 sleep_between 让微信有时间处理每一层事件。
-    """
-    if pyautogui is not None:
+def _three_step_click_center(cx, cy, label: str, sleep_between=2.0):
+    """3 步真实点击（pyautogui.click -> doubleClick -> uiautomation.Click）。"""
+    log.info(f"[3STEP:{label}] 目标 ({cx},{cy}) sleep_between={sleep_between}")
+    if pyautogui is None:
+        log.warning(f"[3STEP:{label}] pyautogui 不可用！3 步点击做不了！")
+        return
+    try:
         pyautogui.moveTo(cx, cy, duration=0.1)
-        time.sleep(0.2)
-        try:
-            pyautogui.click(cx, cy)
-            log.info(f"  pyautogui.click ({cx},{cy})")
-        except Exception as e:
-            log.warning(f"  pyautogui.click 失败：{e}")
-        time.sleep(sleep_between)
-        try:
-            pyautogui.doubleClick(cx, cy)
-            log.info(f"  pyautogui.doubleClick ({cx},{cy})")
-        except Exception as e:
-            log.warning(f"  pyautogui.doubleClick 失败：{e}")
-        time.sleep(sleep_between)
+        log.info(f"[3STEP:{label}]   moveTo ✅")
+    except Exception as e:
+        log.warning(f"[3STEP:{label}]   moveTo ❌ {e}")
+    time.sleep(0.2)
+    # Step 1
+    try:
+        pyautogui.click(cx, cy)
+        log.info(f"[3STEP:{label}]   click ✅ ({cx},{cy})")
+    except Exception as e:
+        log.warning(f"[3STEP:{label}]   click ❌ {e}")
+    time.sleep(sleep_between)
+    # Step 2
+    try:
+        pyautogui.doubleClick(cx, cy)
+        log.info(f"[3STEP:{label}]   doubleClick ✅ ({cx},{cy})")
+    except Exception as e:
+        log.warning(f"[3STEP:{label}]   doubleClick ❌ {e}")
+    time.sleep(sleep_between)
 
 
 def _click_qr_button(win, button) -> bool:
     """点击 玩家二维码 按钮。"""
-    _activate_window(win); time.sleep(0.5)
-    r = button.BoundingRectangle
-    cx = int((r.left + r.right) / 2)
-    cy = int((r.top + r.bottom) / 2)
-    _three_step_click_center(cx, cy, sleep_between=0.5)
+    log.info(f"[BTN_CLICK] 开始点 玩家二维码 按钮 ...")
+    _activate_window(win)
+    time.sleep(0.5)
+    try:
+        r = button.BoundingRectangle
+        cx = int((r.left + r.right) / 2)
+        cy = int((r.top + r.bottom) / 2)
+        log.info(f"[BTN_CLICK] button rect=({r.left},{r.top},{r.right},{r.bottom}) center=({cx},{cy})")
+    except Exception as e:
+        log.warning(f"[BTN_CLICK] button.BoundingRectangle 失败：{e}")
+        return False
+
+    _save_screen("09_before_click_qr_button")
+    _three_step_click_center(cx, cy, label="QR_BUTTON", sleep_between=0.5)
     try:
         button.Click()
-        log.info("  button.Click()")
+        log.info("[BTN_CLICK]   button.Click() ✅")
     except Exception as e:
-        log.warning(f"  button.Click() 失败，回退 Invoke：{e}")
-        _click_control(button)
+        log.warning(f"[BTN_CLICK]   button.Click() ❌ {e}，回退 _click_control")
+        _click_control(button, label="QR_BUTTON_FALLBACK")
+    _save_screen("10_after_click_qr_button")
     return True
 
 
 def _click_card(win, card) -> None:
-    """
-    点击二维码卡片，必须走 3 步序列：
-    pyautogui.click → pyautogui.doubleClick → uiautomation.Click()。
-    只走任意一步，实测都不会触发微信内置浏览器弹窗。
-    """
-    _activate_window(win); time.sleep(0.5)
-    r = card.BoundingRectangle
-    cx = int((r.left + r.right) / 2)
-    cy = int((r.top + r.bottom) / 2)
-    _three_step_click_center(cx, cy, sleep_between=2.0)
+    """点击二维码卡片。"""
+    log.info(f"[CARD_CLICK] 开始点卡片 ...")
+    _activate_window(win)
+    time.sleep(0.5)
+    try:
+        r = card.BoundingRectangle
+        cx = int((r.left + r.right) / 2)
+        cy = int((r.top + r.bottom) / 2)
+        log.info(f"[CARD_CLICK] card rect=({r.left},{r.top},{r.right},{r.bottom}) center=({cx},{cy})")
+    except Exception as e:
+        log.warning(f"[CARD_CLICK] card.BoundingRectangle 失败：{e}")
+        return
+    _save_screen("11_before_click_card")
+    _three_step_click_center(cx, cy, label="CARD", sleep_between=2.0)
     try:
         card.Click()
-        log.info("  card.Click()")
+        log.info("[CARD_CLICK]   card.Click() ✅")
     except Exception as e:
-        log.warning(f"  card.Click() 失败：{e}")
-        _click_control(card)
+        log.warning(f"[CARD_CLICK]   card.Click() ❌ {e}，回退 _click_control")
+        _click_control(card, label="CARD_FALLBACK")
+    _save_screen("12_after_click_card")
 
 
 def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
-    """跑一次完整子流程：点按钮 -> 等卡片 -> 点卡片 -> OCR。"""
+    """跑一次完整子流程。"""
     out = {"ok": False, "link": None, "stage": f"outer_pass_{pass_index}_start",
            "card_found": False, "card_clicked": False, "error": None}
+    log.info(f"======= _single_pass #{pass_index}/{cfg.max_outer_retries} =======")
 
     out["stage"] = f"outer_pass_{pass_index}_click_button"
     _click_qr_button(win, button)
@@ -485,12 +766,16 @@ def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
     out["stage"] = f"outer_pass_{pass_index}_wait_card"
     card = None
     for i in range(cfg.retry_count + 1):
+        log.info(f"[PASS{pass_index}] 等待卡片，尝试 {i+1}/{cfg.retry_count+1} ...")
         card = _find_latest_qr_card(win, timeout=cfg.card_wait_timeout)
         if card is not None:
             break
-        log.info(f"[pass {pass_index}] 等卡片 retry {i+1}/{cfg.retry_count+1}")
         if i < cfg.retry_count:
+            err = _detect_error_card(win)
+            if err:
+                log.warning(f"[PASS{pass_index}] 检测到错误卡片：{err}")
             time.sleep(cfg.retry_interval)
+            log.info(f"[PASS{pass_index}] 再点一次玩家二维码按钮重试 ...")
             _click_qr_button(win, button)
 
     if card is None:
@@ -507,7 +792,11 @@ def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
     _click_card(win, card)
     out["card_clicked"] = True
 
+    log.info(f"[PASS{pass_index}] 点完卡片，睡 {cfg.wait_after_card_click}s 等内置浏览器加载 ...")
     time.sleep(cfg.wait_after_card_click)
+    _save_screen("13_after_card_wait_10s")
+    _log_all_top_windows("AFTER_CARD_WAIT")
+
     out["stage"] = f"outer_pass_{pass_index}_ocr"
     link = _try_find_qr_link_on_screen(attempts=6, interval=2.0)
     if link:
@@ -518,15 +807,17 @@ def _single_pass(win, button, pass_index: int, cfg: FetchConfig) -> Dict:
         out["stage"] = f"outer_pass_{pass_index}_ocr_failed"
         out["error"] = (out.get("error") or "屏幕没识别到二维码") + \
                        " - 可能卡在内置浏览器 / 二维码未显示"
+        _save_screen("14_ocr_failed")
+        _log_all_top_windows("OCR_FAILED")
     return out
 
 
 def fetch_qr_code(cfg=None) -> Dict:
-    """
-    Debug 版主流程：外层最多跑 max_outer_retries 次完整子流程。
-    每次如果没等到卡片 / 扫不到二维码，就等 jitter 秒后再点一次 玩家二维码 重来。
-    """
+    """主流程。"""
     cfg = cfg or FetchConfig()
+    log.info("=" * 80)
+    log.info(f"🚀 fetch_qr_code 启动 cfg={cfg}")
+    log.info(f"📝 日志文件: {_LOG_FILE}")
     _co_init()
 
     result = {
@@ -539,27 +830,32 @@ def fetch_qr_code(cfg=None) -> Dict:
         "pass_history": [],
         "last_error_text": None,
         "note": "",
+        "log_file": _LOG_FILE,   # 让前端能直接拿到日志路径
     }
 
-    log.info("fetch_qr_code: locating WeChat window...")
+    # Step 1: 找微信窗口
     result["stage"] = "locate_window"
     win = _get_wechat_window()
     if win is None:
         result["error"] = "找不到微信窗口，请确认 PC 微信已登录"
         result["note"] = result["error"]
+        _save_screen("FAIL_no_wechat_window")
         return result
+    _save_screen("00_wechat_window_found")
 
-    log.info(f"fetch_qr_code: found window Name={win.Name} ClassName={win.ClassName}")
+    # Step 2: 激活
     result["stage"] = "activate"
     _activate_window(win)
     win_region = _get_window_region(win)
-    log.info(f"微信窗口区域：{win_region}")
+    _log_wechat_subtree(win, prefix="WECHAT_TREE_TOP")
 
+    # Step 3: 打开底部菜单
     result["stage"] = "open_biz_menu"
     if not _ensure_biz_menu_view(win, win_region, cfg):
         result["error"] = "无法打开底部 我的记录/玩家二维码 菜单"
         return result
 
+    # Step 4: 定位按钮
     button = None
     for i in range(cfg.retry_count + 1):
         result["stage"] = f"find_button_try_{i+1}"
@@ -567,16 +863,16 @@ def fetch_qr_code(cfg=None) -> Dict:
         if button is not None:
             break
         if i < cfg.retry_count:
-            # 可能菜单关闭了 -> 重新展开
-            _ensure_biz_menu_view(win, win_region, cfg)
             time.sleep(cfg.retry_interval)
+            _ensure_biz_menu_view(win, win_region, cfg)
 
     if button is None:
-        log.warning("没找到玩家二维码按钮，外层重试也没法继续，直接放弃")
+        log.warning("❌ 没法继续：玩家二维码按钮始终找不到")
         result["error"] = "找不到玩家二维码按钮（底部菜单里的 BizMenuButton）"
         result["note"] = result["error"]
         return result
 
+    # Step 5: 外层循环
     for pass_index in range(1, cfg.max_outer_retries + 1):
         one = _single_pass(win, button, pass_index, cfg)
         result["pass_history"].append({
@@ -594,6 +890,8 @@ def fetch_qr_code(cfg=None) -> Dict:
             result["link"] = one["link"]
             result["stage"] = "done"
             result["note"] = f"成功获取二维码链接（第 {pass_index}/{cfg.max_outer_retries} 次尝试）"
+            _save_screen("15_SUCCESS_QR")
+            log.info(f"🎉 最终 link = {one['link']}")
             return result
 
         err_txt = one.get("error") or ""
@@ -607,6 +905,7 @@ def fetch_qr_code(cfg=None) -> Dict:
             result["stage"] = f"outer_pass_{pass_index}_sleep_{int(jitter)}s"
             time.sleep(jitter)
 
+    # 失败收尾
     result["stage"] = "all_retries_exhausted"
     final_reason = result["last_error_text"] or "未知原因"
     result["error"] = (
@@ -616,18 +915,16 @@ def fetch_qr_code(cfg=None) -> Dict:
     )
     result["note"] = (
         "连续 %d 次重试仍失败。最后一次：%s。"
-        "请先手动打开微信确认公众号有没有真的发卡片，"
-        "或检查是否有网络 / 公众号服务故障。"
-        % (cfg.max_outer_retries, final_reason)
+        "详细日志：%s"
+        % (cfg.max_outer_retries, final_reason, _LOG_FILE)
     )
-
-    # 失败时截一张整屏，方便排查
     try:
-        img = _screenshot(None)
+        img = _screenshot(None, label="final_fail_fullscreen")
         result["raw_png_base64"] = _save_png_base64(img)
+        _save_screen("16_FAIL_FINAL_FULLSCREEN")
     except Exception as e:
         log.warning(f"保存失败截图也出错：{e}")
-
+    log.error(f"🚨 全部 {cfg.max_outer_retries} 次都失败了。最终错误：{final_reason}")
     return result
 
 
@@ -637,8 +934,8 @@ if __name__ == "__main__":
     import json
     safe = {}
     for k, v in r.items():
-        if isinstance(v, str) and len(v) > 120:
-            safe[k] = v[:120] + "..."
+        if isinstance(v, str) and len(v) > 200:
+            safe[k] = v[:200] + "..."
         else:
             safe[k] = v
     print(json.dumps(safe, ensure_ascii=False, indent=2))
