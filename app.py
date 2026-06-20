@@ -4,16 +4,34 @@ from typing import Dict, Optional
 from flask import Flask, jsonify, request, Response
 from qr_fetcher import fetch_qr_code, FetchConfig
 from qr_utils import generate_qr_base64
+
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("app")
+
 _state_lock = threading.Lock()
 STATE = {
-    "running": False, "started_at": None, "finished_at": None,
-    "ok": None, "stage": None, "link": None,
-    "qr_png_base64": None, "raw_png_base64": None, "error": None,
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "ok": None,
+    "stage": None,
+    "link": None,
+    "qr_png_base64": None,
+    "raw_png_base64": None,
+    "error": None,
+    # ---- debug 字段 ----
+    "outer_attempts": None,
+    "outer_finished": None,
+    "pass_history": None,
+    "last_error_text": None,
+    "note": None,
 }
+
+
 def _run_in_background(cfg: FetchConfig) -> None:
+    """后台执行一次扫码任务，把 fetch_qr_code 返回的所有字段都塞回 STATE。"""
     with _state_lock:
         STATE["running"] = True
         for k in list(STATE.keys()):
@@ -32,6 +50,11 @@ def _run_in_background(cfg: FetchConfig) -> None:
             STATE["qr_png_base64"] = qr_png_b64
             STATE["raw_png_base64"] = result.get("raw_png_base64")
             STATE["error"] = result.get("error")
+            STATE["outer_attempts"] = result.get("outer_attempts")
+            STATE["outer_finished"] = result.get("outer_finished")
+            STATE["pass_history"] = result.get("pass_history")
+            STATE["last_error_text"] = result.get("last_error_text")
+            STATE["note"] = result.get("note")
     except Exception as e:
         log.exception("fetch_qr_code 抛异常了")
         with _state_lock:
@@ -39,6 +62,9 @@ def _run_in_background(cfg: FetchConfig) -> None:
             STATE["finished_at"] = time.time()
             STATE["ok"] = False
             STATE["error"] = f"{type(e).__name__}: {e}"
+            STATE["note"] = f"执行异常：{type(e).__name__}: {e}"
+
+
 def _parse_region(raw) -> Optional[tuple]:
     if not raw:
         return None
@@ -49,25 +75,43 @@ def _parse_region(raw) -> Optional[tuple]:
     except Exception:
         pass
     return None
+
+
 @app.route("/api/get_qr", methods=["POST"])
 def api_get_qr():
+    """触发一次扫码。JSON 参数可选：
+        wait_after_button_click, wait_after_card_click, wait_before_scan,
+        qr_region (格式：l,t,r,b),
+        max_outer_retries (外层重试次数，默认 5),
+        outer_retry_jitter_min / outer_retry_jitter_max (默认 5 / 8 秒)
+    """
     with _state_lock:
         if STATE["running"]:
             return jsonify({"ok": False, "error": "已有任务在跑"}), 409
     data = request.get_json(silent=True) or {}
+    j_min = float(data.get("outer_retry_jitter_min", 5.0))
+    j_max = float(data.get("outer_retry_jitter_max", 8.0))
+    if j_max < j_min:
+        j_max = j_min
     cfg = FetchConfig(
         wait_after_button_click=float(data.get("wait_after_button_click", 2.0)),
         wait_after_card_click=float(data.get("wait_after_card_click", 3.0)),
         wait_before_scan=float(data.get("wait_before_scan", 2.5)),
         qr_region=_parse_region(data.get("qr_region")),
+        max_outer_retries=int(data.get("max_outer_retries", 5)),
+        outer_retry_jitter=(j_min, j_max),
     )
     threading.Thread(target=_run_in_background, args=(cfg,), daemon=True).start()
     log.info(f"已触发任务 cfg={cfg}")
     return jsonify({"ok": True, "message": "任务已触发，请轮询 /api/qr_result"})
+
+
 @app.route("/api/qr_result", methods=["GET"])
 def api_qr_result():
     with _state_lock:
         return jsonify({k: STATE[k] for k in STATE})
+
+
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     with _state_lock:
@@ -77,6 +121,8 @@ def api_reset():
             STATE[k] = None
         STATE["running"] = False
     return jsonify({"ok": True})
+
+
 @app.route("/api/current_link", methods=["GET"])
 def api_current_link():
     with _state_lock:
@@ -85,13 +131,15 @@ def api_current_link():
         if not STATE["link"]:
             return jsonify({"ok": False, "error": "还没拿到链接"}), 404
         return jsonify({"ok": True, "link": STATE["link"]})
+
+
 INDEX_HTML = (
     "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>RemoteDX - 远程扫码</title>"
     "<style>"
     "body{font-family:-apple-system,Segoe UI,Microsoft YaHei,Arial,sans-serif;"
-    "background:#0f1115;color:#e5e7eb;max-width:720px;margin:32px auto;padding:0 16px;}"
+    "background:#0f1115;color:#e5e7eb;max-width:760px;margin:32px auto;padding:0 16px;}"
     "h1{font-size:22px;margin:0 0 8px;color:#fff;}"
     ".sub{color:#9ca3af;margin-bottom:20px;}"
     "button{background:#10b981;color:#fff;border:0;padding:12px 24px;"
@@ -100,28 +148,40 @@ INDEX_HTML = (
     ".card{background:#181b22;border-radius:12px;padding:16px;margin-top:16px;"
     "border:1px solid #23262f;}"
     ".muted{color:#94a3b8;font-size:12px;word-break:break-all;}"
-    ".ok{color:#34d399;}.bad{color:#f87171;}"
+    ".ok{color:#34d399;}.bad{color:#f87171;}.warn{color:#fbbf24;}"
     "canvas{display:block;background:#fff;border-radius:8px;margin-top:10px;}"
     ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}"
-    "input[type=text]{flex:1;padding:10px 12px;border-radius:8px;border:1px solid #2d3139;"
-    "background:#121418;color:#e5e7eb;font-size:14px;min-width:240px;}"
-    "label{font-size:13px;color:#94a3b8;}"
+    "input[type=text],input[type=number]{padding:10px 12px;border-radius:8px;"
+    "border:1px solid #2d3139;background:#121418;color:#e5e7eb;"
+    "font-size:14px;min-width:120px;}"
+    "label{font-size:13px;color:#94a3b8;display:flex;align-items:center;gap:6px;}"
     "a{color:#60a5fa;word-break:break-all;}"
+    "table{font-size:12px;color:#cbd5e1;border-collapse:collapse;margin-top:10px;}"
+    "td,th{border-bottom:1px solid #23262f;padding:4px 8px;}"
+    "th{color:#94a3b8;text-align:left;font-weight:normal;}"
+    "code{background:#0b0d12;padding:2px 6px;border-radius:4px;color:#cbd5e1;}"
     "</style></head><body>"
     "<h1>RemoteDX - 远程扫码登录</h1>"
-    "<div class=\"sub\">微信窗口 -> 玩家二维码按钮 -> 链接卡片 -> 二维码图 -> 手机扫码</div>"
+    "<div class=\"sub\">微信窗口 -> 玩家二维码按钮 -> 链接卡片 -> 二维码图 -> 手机扫码"
+    " · 最多 5 次外层重试 ·</div>"
     "<div class=\"card\">"
     "<div class=\"row\">"
     "<button id=\"go\">触发一次扫码</button>"
     "<button id=\"reset\">清空</button>"
     "</div>"
     "<div class=\"row\" style=\"margin-top:10px;\">"
-    "<label style=\"display:flex;align-items:center;gap:6px;\">"
-    "二维码屏幕区域 (left,top,right,bottom, 留空=全屏)"
-    "<input id=\"region\" type=\"text\" placeholder=\"例如: 1300,400,1700,800\" value=\"\">"
-    "</label></div></div>"
+    "<label>"
+    "屏幕区域 (l,t,r,b)"
+    "<input id=\"region\" type=\"text\" placeholder=\"例如 1300,400,1700,800\" value=\"\">"
+    "</label>"
+    "<label>"
+    "外层重试"
+    "<input id=\"retries\" type=\"number\" min=\"1\" max=\"20\" value=\"5\" style=\"width:70px;\">"
+    "</label>"
+    "</div></div>"
     "<div class=\"card\" id=\"status\"><div id=\"stage\">等待触发...</div>"
-    "<div id=\"err\" class=\"muted\" style=\"margin-top:6px;\"></div></div>"
+    "<div id=\"err\" class=\"muted\" style=\"margin-top:6px;\"></div>"
+    "<div id=\"passes\" style=\"margin-top:8px;\"></div></div>"
     "<div class=\"card\" id=\"qrbox\" style=\"display:none;\">"
     "<div class=\"ok\">已识别到登录链接:</div>"
     "<a id=\"link\" target=\"_blank\" rel=\"noopener\"></a>"
@@ -130,33 +190,67 @@ INDEX_HTML = (
     "用手机微信扫这张码 / 点上方链接</div></div>"
     "<script>"
     "const $=id=>document.getElementById(id);"
+    "const STAGE_MAP={"
+    "'locate_window':'寻找微信窗口...',"
+    "'activate':'激活微信窗口...',"
+    "'find_button_try_1':'寻找玩家二维码按钮...',"
+    "'find_button_try_2':'重试找按钮...',"
+    "'find_button_try_3':'再次重试...',"
+    "'outer_pass_':'点玩家二维码按钮并拉卡片...',"
+    "'wait_card':'等待链接卡片出现...',"
+    "'click_card':'点击链接卡片...',"
+    "'ocr_screen':'屏幕识别二维码...',"
+    "'done':'识别完成',"
+    "'all_retries_exhausted':'全部重试耗尽',"
+    "};"
+    "function stageText(s){if(!s)return'';"
+    "if(s.startsWith('outer_pass_')){"
+    "const m=s.match(/outer_pass_(\\d+)_/);"
+    "if(m){return '第 '+m[1]+' 次外层尝试...';}}"
+    "if(s in STAGE_MAP) return STAGE_MAP[s];"
+    "for(const k in STAGE_MAP) if(s.startsWith(k)) return STAGE_MAP[k];"
+    "return s;}"
+    "function renderPasses(passes,total,finished){if(!passes||!passes.length){passes.innerHTML='';return;}"
+    "let html='<table><tr><th>#</th><th>卡片</th><th>点击</th><th>结果</th></tr>';"
+    "for(const p of passes){"
+    "const col=p.ok?'ok':(p.card_found?'warn':'bad');"
+    "const card=p.card_found?'✓':'✗';"
+    "const click=p.card_clicked?'✓':'—';"
+    "const ok=p.ok?'拿到链接':(p.error?('失败：'+p.error.substring(0,40)):'失败');"
+    "html+=`<tr><td>#${p.n}</td><td class=\"${col}\">${card}</td><td>${click}</td><td class=\"${col}\">${ok}</td></tr>`;}"
+    "html+='</table>';"
+    "if(finished!=null&&total!=null&&!passes[passes.length-1].ok){"
+    "html+=`<div class=\"warn\" style=\"margin-top:6px;\">已跑 ${finished}/${total} 次，均未成功</div>`;}"
+    "passes.innerHTML=html;}"
     "async function go(){go.disabled=true;reset.disabled=true;"
-    "stage.textContent='已触发,后台执行中...';err.textContent='';"
+    "stage.textContent='已触发，后台执行中...';err.textContent='';passes.innerHTML='';"
     "qrbox.style.display='none';"
     "try{const body={};const r=region.value.trim();if(r)body.qr_region=r;"
+    "const n=parseInt(retries.value,10);if(n>0)body.max_outer_retries=n;"
     "const resp=await fetch('/api/get_qr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
     "const j=await resp.json();if(!j.ok){stage.textContent='触发失败';err.textContent=j.error||'';}else poll();}"
     "catch(e){stage.textContent='请求失败';err.textContent=String(e);"
     "go.disabled=false;reset.disabled=false;}}"
     "async function reset(){await fetch('/api/reset',{method:'POST'});"
-    "stage.textContent='等待触发...';err.textContent='';qrbox.style.display='none';}"
+    "stage.textContent='等待触发...';err.textContent='';passes.innerHTML='';"
+    "qrbox.style.display='none';}"
     "async function poll(){let last=null;"
     "while(true){const r=await fetch('/api/qr_result').then(x=>x.json());"
     "if(r.stage&&r.stage!==last){last=r.stage;"
-    "const map={'locate_window':'寻找微信窗口...','activate':'激活微信窗口...',"
-    "'find_button_try_1':'寻找玩家二维码按钮...','find_button_try_2':'重试找按钮...','find_button_try_3':'再次重试...',"
-    "'click_button':'点击玩家二维码按钮...','wait_card':'等待链接卡片出现...','click_card':'点击链接卡片...',"
-    "'ocr_screen':'屏幕识别二维码...','done':'识别完成'};"
-    "stage.textContent=map[r.stage]||r.stage;}"
-    "if(!r.running){if(r.ok){stage.textContent='成功';"
+    "stage.textContent=stageText(r.stage);}"
+    "if(r.pass_history) renderPasses(r.pass_history,r.outer_attempts,r.outer_finished);"
+    "if(!r.running){"
+    "if(r.ok){stage.textContent='成功';"
     "link.href=r.link;link.textContent=r.link;"
     "if(r.qr_png_base64){const img=new Image();"
-    "img.onload=()=>{const c=qrcanvas;"
-    "c.width=img.width;c.height=img.height;"
+    "img.onload=()=>{const c=qrcanvas;c.width=img.width;c.height=img.height;"
     "c.getContext('2d').drawImage(img,0,0);};"
     "img.src='data:image/png;base64,'+r.qr_png_base64;"
-    "qrbox.style.display='block';}}"
-    "else{stage.innerHTML='失败 - <span class=\"bad\">'+(r.error||'未知')+'</span>';"
+    "qrbox.style.display='block';}"
+    "}else{"
+    "stage.innerHTML='<span class=\"bad\">失败</span>';"
+    "err.innerHTML=(r.note?('<div class=\"warn\">'+r.note+'</div>'):'')+"
+    "('原因：'+(r.error||'未知'));"
     "if(r.raw_png_base64){const img=new Image();"
     "img.onload=()=>{const c=document.createElement('canvas');"
     "c.width=img.width;c.height=img.height;"
@@ -168,9 +262,13 @@ INDEX_HTML = (
     "go.onclick=go;reset.onclick=reset;"
     "</script></body></html>"
 )
+
+
 @app.route("/", methods=["GET"])
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
+
+
 if __name__ == "__main__":
     import sys
     host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
