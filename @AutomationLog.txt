@@ -1,0 +1,14 @@
+2026-06-20 21:28:15.761 <string>[45] <module> -> Find Control Timeout(10s): {ClassName: 'WeChatMainWndForPC', ControlType: WindowControl}
+2026-06-20 21:29:13.919 <string>[7] <module> -> Find Control Timeout(10s): {ClassName: 'mmui::LoginWindow', ControlType: WindowControl}
+2026-06-20 21:29:24.028 <string>[7] <module> -> Find Control Timeout(10s): {ClassName: 'WeChatMainWndForPC', ControlType: WindowControl}
+2026-06-20 21:29:27.038 <string>[1] <module> -> Find Control Timeout(10s): {ClassName: 'mmui::LoginWindow', ControlType: WindowControl}
+
+[WinError -2147221008] 尚未调用 CoInitialize。
+Can not load UIAutomationCore.dll.
+1, You may need to install Windows Update KB971513 if your OS is Windows XP, see https://github.com/yinkaisheng/WindowsUpdateKB971513ForIUIAutomation
+2, You need to use an UIAutomationInitializerInThread object if use uiautomation in a thread, see demos/uiautomation_in_thread.py
+
+[WinError -2147221008] 尚未调用 CoInitialize。
+Can not load UIAutomationCore.dll.
+1, You may need to install Windows Update KB971513 if your OS is Windows XP, see https://github.com/yinkaisheng/WindowsUpdateKB971513ForIUIAutomation
+2, You need to use an UIAutomationInitializerInThread object if use uiautomation in a thread, see demos/uiautomation_in_thread.py
