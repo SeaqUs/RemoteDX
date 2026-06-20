@@ -1,14 +1,7 @@
-﻿# RemoteDX 依赖清单
-# 在已登录 PC 微信的 Windows 机器上执行: pip install -r requirements.txt
-# === 核心 ===
-Flask>=2.3.0          # HTTP 服务
-uiautomation>=2.0.17  # Windows UI 自动化（操控微信窗口）
-pywin32>=306          # Windows API 底层支持（uiautomation 依赖）
-# === 二维码处理 ===
-qrcode>=7.4.2         # 生成二维码图片
-Pillow>=10.0.0        # 图片读写（qrcode/pyzbar/pyautogui 都依赖）
-# === 截图与图像识别（兜底方案：UI 拿不到链接时直接从屏幕截） ===
-pyautogui>=0.9.54     # 跨屏截图 + 模拟鼠标/键盘（兜底用）
-pyzbar>=0.1.9         # 从截图里解码二维码（需要系统装 libzbar）
-# === 可选：如果 pyzbar 装不了，用 qreader（纯 Python，无需 libzbar） ===
-# qreader>=3.0.4
+Flask>=2.3.0
+uiautomation>=2.0.17
+pywin32>=306
+qrcode>=7.4.2
+Pillow>=10.0.0
+pyautogui>=0.9.54
+pyzbar>=0.1.9

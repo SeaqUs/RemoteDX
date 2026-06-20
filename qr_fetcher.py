@@ -1,77 +1,54 @@
 """
 qr_fetcher.py - 微信自动化控制器
-=================================
-流程：
-    激活微信窗口 -> 点击舞萌 DX 公众号里的 玩家二维码 按钮 ->
-    等待弹出二维码面板 -> 截图 + pyzbar 解码 -> 返回登录链接。
-控件定位依据（来自 Inspect.exe 探针数据）：
-    窗口 : Name = "微信"
-    按钮 : Name = "玩家二维码", ControlType = Button,
-           ClassName = "mmui::BizMenuButton", FrameworkId = "Qt"
-设计原则：
-    1. uiautomation 优先（稳定、有语义）；
-    2. 找不到时回退到 pyautogui 坐标模拟；
-    3. 拿不到链接时回退到 pyzbar 屏幕 OCR（最兜底的路径）；
-    4. 每一步都打日志，方便定位哪一步失败。
+完整流程：微信窗口 -> 玩家二维码按钮 -> 链接卡片 -> 内置浏览器 -> OCR取链接
 """
-import logging
-import io
-import base64
-import time
+import logging, io, base64, time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
-# ============== 可选依赖（不装也能跑，但会自动降级） ==============
 try:
-    import uiautomation as auto   # type: ignore
+    import uiautomation as auto
 except ImportError:
     auto = None
 try:
-    import pyautogui              # type: ignore
-    pyautogui.FAILSAFE = True     # 鼠标甩到左上角时自动中止，防止失控
+    import pyautogui
+    pyautogui.FAILSAFE = True
 except ImportError:
     pyautogui = None
 try:
-    from pyzbar.pyzbar import decode as pyzbar_decode  # type: ignore
+    from pyzbar.pyzbar import decode as pyzbar_decode
 except ImportError:
     pyzbar_decode = None
 try:
-    from PIL import ImageGrab    # type: ignore
+    from PIL import ImageGrab
 except ImportError:
     ImageGrab = None
-# ============== 日志 ==============
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("qr_fetcher")
-# ============== 常量（来自 Inspect 探针） ==============
 WECHAT_WINDOW_NAME = "微信"
-# ============== 配置 ==============
+QR_BUTTON_NAME = "玩家二维码"
+CARD_CLASSNAME = "mmui::ChatBubbleItemView"
+CARD_KEYWORD = "舞萌DX"
 @dataclass
 class FetchConfig:
-    """一次扫码任务的参数，全部带默认值。"""
-    wait_after_click: float = 2.0       # 点完按钮后等它渲染
-    wait_before_scan: float = 3.0       # 再等一会儿，确保二维码画面稳定
-    retry_count: int = 2                # 找按钮失败时的重试次数
-    retry_interval: float = 2.0         # 重试之间间隔
+    wait_after_button_click: float = 2.0
+    wait_after_card_click: float = 3.0
+    wait_before_scan: float = 2.5
+    retry_count: int = 2
+    retry_interval: float = 2.0
+    card_wait_timeout: float = 15.0
     qr_region: Optional[Tuple[int, int, int, int]] = None
-    # qr_region 格式 (left, top, right, bottom)；None 表示全屏扫
-    # 可以先不传，肉眼看见二维码后再填进来
-# ============== 微信窗口 / 按钮定位 ==============
-def _get_wechat_window() -> Optional["auto.WindowControl"]:
-    """找到名字叫 '微信' 的顶层窗口，找不到返回 None。"""
+def _get_wechat_window():
     if auto is None:
-        log.error("uiautomation 未安装，无法定位微信窗口")
+        log.error("uiautomation 未安装")
         return None
     try:
         win = auto.WindowControl(searchDepth=1, Name=WECHAT_WINDOW_NAME)
-        win.GetRuntimeId()  # 触发一次实际查找，不存在会抛异常
+        win.GetRuntimeId()
         return win
     except Exception as e:
-        log.warning(f"找不到微信窗口 微信：{e}")
+        log.warning(f"找不到微信窗口：{e}")
         return None
 def _activate_window(win) -> bool:
-    """把窗口拉到前台。"""
     try:
         win.SetActive()
         time.sleep(0.6)
@@ -79,61 +56,32 @@ def _activate_window(win) -> bool:
     except Exception as e:
         log.warning(f"激活窗口失败：{e}")
         return False
-def _find_qr_button(win) -> Optional["auto.ButtonControl"]:
-    """在微信窗口里找 玩家二维码 按钮。
-    思路：FrameworkId 是 Qt，uiautomation 未必能递归枚举到 Qt WebEngine
-    里的子控件；我们直接用 Name 匹配。
-    """
-    if win is None:
-        return None
-    # 策略 1：直接在窗口下按 Name + Button 类型找
+def _walk_controls(node, max_depth: int) -> list:
+    result = []
+    if max_depth <= 0:
+        return result
     try:
-        btn = win.ButtonControl(searchDepth=10, Name="玩家二维码")
-        btn.GetRuntimeId()
-        log.info(f"找到按钮：Name={btn.Name}, ClassName={btn.ClassName}")
-        return btn
-    except Exception as e:
-        log.info(f"uiautomation 按 Name 没找到：{e}")
-    # 策略 2：递归遍历整个窗口子树，按 Name 挑
-    controls = []
-    def walk(node, depth):
-        if depth <= 0:
-            return
-        try:
-            for c in node.GetChildren():
-                controls.append(c)
-                walk(c, depth - 1)
-        except Exception:
-            pass
-    for depth in (5, 10, 20):
-        controls.clear()
-        walk(win, depth)
-        for c in controls:
-            try:
-                if getattr(c, "Name", None) == "玩家二维码":
-                    log.info(f"遍历找到按钮 (depth={depth})：ClassName={c.ClassName}")
-                    return c
-            except Exception:
-                continue
-    log.warning("所有 uiautomation 策略都没定位到 玩家二维码 按钮")
-    return None
+        children = node.GetChildren()
+    except Exception:
+        return result
+    for c in children:
+        result.append(c)
+        result.extend(_walk_controls(c, max_depth - 1))
+    return result
 def _click_control(ctrl) -> bool:
-    """uiautomation 优先，失败回退到 pyautogui 中心坐标点击。"""
-    # 第一选择：Invoke Pattern（官方推荐方式，比 Click() 更稳）
     if auto is not None:
         try:
             ctrl.GetInvokePattern().Invoke()
-            log.info("通过 Invoke Pattern 点击成功")
+            log.info("Invoke Pattern 点击成功")
             return True
         except Exception:
             pass
         try:
             ctrl.Click()
-            log.info("通过 .Click() 点击成功")
+            log.info(".Click() 点击成功")
             return True
         except Exception as e:
             log.warning(f"uiautomation 点击失败：{e}")
-    # 第二选择：pyautogui 点中心
     if pyautogui is not None:
         try:
             rect = ctrl.BoundingRectangle
@@ -145,9 +93,52 @@ def _click_control(ctrl) -> bool:
         except Exception as e:
             log.warning(f"pyautogui 坐标点击也失败：{e}")
     return False
-# ============== 二维码识别 ==============
-def _screenshot(region: Optional[Tuple[int, int, int, int]] = None):
-    """截指定区域（region 格式 left,top,right,bottom），region=None 就是全屏。返回 PIL.Image。"""
+def _find_qr_button(win):
+    if win is None:
+        return None
+    try:
+        btn = win.ButtonControl(searchDepth=15, Name=QR_BUTTON_NAME)
+        btn.GetRuntimeId()
+        log.info(f"找到按钮 Name={btn.Name}, ClassName={btn.ClassName}")
+        return btn
+    except Exception as e:
+        log.info(f"ButtonControl 按 Name 没找到：{e}")
+    for depth in (10, 20, 30):
+        for c in _walk_controls(win, depth):
+            try:
+                if getattr(c, "Name", None) == QR_BUTTON_NAME:
+                    log.info(f"遍历找到玩家二维码按钮 (depth={depth}) ClassName={c.ClassName}")
+                    return c
+            except Exception:
+                continue
+    log.warning("所有策略都没定位到 玩家二维码 按钮")
+    return None
+def _find_latest_qr_card(win, timeout=15.0):
+    """在消息列表里找最新的舞萌DX链接卡片（取 y 最大即最靠下那条）。"""
+    if win is None:
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        candidates = []
+        if auto is not None:
+            all_nodes = _walk_controls(win, 30)
+            for c in all_nodes:
+                try:
+                    cn = getattr(c, "ClassName", "") or ""
+                    nm = getattr(c, "Name", "") or ""
+                    if CARD_CLASSNAME in cn and CARD_KEYWORD in str(nm):
+                        candidates.append(c)
+                except Exception:
+                    continue
+        if candidates:
+            latest = max(candidates, key=lambda c: (getattr(getattr(c, "BoundingRectangle", None), "bottom", None) or 0))
+            log.info(f"找到链接卡片：Name={latest.Name[:60]}... ClassName={latest.ClassName}")
+            return latest
+        log.info(f"还没看到链接卡片，1s 后再找 (剩余 {int(deadline - time.time())}s)")
+        time.sleep(1)
+    log.warning(f"等了 {timeout}s 还是没找到链接卡片")
+    return None
+def _screenshot(region=None):
     if ImageGrab is None and pyautogui is None:
         raise RuntimeError("Pillow 或 pyautogui 至少得装一个才能截图")
     if ImageGrab is not None:
@@ -156,8 +147,7 @@ def _screenshot(region: Optional[Tuple[int, int, int, int]] = None):
         left, top, right, bottom = region
         return pyautogui.screenshot(region=(left, top, right - left, bottom - top))
     return pyautogui.screenshot()
-def _decode_qr_image(pil_img) -> Optional[str]:
-    """pyzbar 解码一张 PIL 图片。失败返回 None。"""
+def _decode_qr_image(pil_img):
     if pyzbar_decode is None:
         log.error("pyzbar 没装，没法从截图识别二维码")
         return None
@@ -172,9 +162,7 @@ def _decode_qr_image(pil_img) -> Optional[str]:
     except Exception as e:
         log.warning(f"pyzbar 解码失败：{e}")
         return None
-def _try_find_qr_link_on_screen(region: Optional[Tuple[int, int, int, int]] = None,
-                                 attempts: int = 3, interval: float = 1.5) -> Optional[str]:
-    """连续截几次屏幕，尝试识别到二维码。"""
+def _try_find_qr_link_on_screen(region=None, attempts=3, interval=1.5):
     for i in range(attempts):
         log.info(f"二维码识别尝试 {i+1}/{attempts} ...")
         try:
@@ -187,36 +175,22 @@ def _try_find_qr_link_on_screen(region: Optional[Tuple[int, int, int, int]] = No
             log.warning(f"截图/解码异常：{e}")
         time.sleep(interval)
     return None
-def _save_png_base64(pil_img) -> str:
-    """把 PIL.Image 转成 Base64 PNG 字符串。"""
+def _save_png_base64(pil_img):
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
-# ============== 对外主入口 ==============
-def fetch_qr_code(cfg: Optional[FetchConfig] = None) -> Dict:
-    """完整跑一遍 "点按钮 -> 取二维码链接"。
-    Returns:
-        dict = {
-            "ok": bool,
-            "link": str | None,
-            "stage": str,          # 哪个阶段成功/失败
-            "error": str | None,
-            "raw_png_base64": str | None,  # 失败现场截图
-        }
-    """
+def fetch_qr_code(cfg=None) -> Dict:
+    """完整跑一遍 点按钮 -> 点链接卡片 -> 取二维码链接。"""
     cfg = cfg or FetchConfig()
     result = {"ok": False, "link": None, "stage": "init",
               "error": None, "raw_png_base64": None}
-    # ---- 1. 找微信窗口 ----
     result["stage"] = "locate_window"
     win = _get_wechat_window()
     if win is None:
-        result["error"] = "找不到微信窗口，请确认 PC 微信已登录并且窗口名字就是 微信"
+        result["error"] = "找不到微信窗口，请确认 PC 微信已登录"
         return result
-    # ---- 2. 激活 ----
     result["stage"] = "activate"
     _activate_window(win)
-    # ---- 3. 找 玩家二维码 按钮 ----
     button = None
     for i in range(cfg.retry_count + 1):
         result["stage"] = f"find_button_try_{i+1}"
@@ -225,31 +199,41 @@ def fetch_qr_code(cfg: Optional[FetchConfig] = None) -> Dict:
             break
         if i < cfg.retry_count:
             time.sleep(cfg.retry_interval)
-    # ---- 4. 点击按钮 ----
-    if button is not None:
-        result["stage"] = "click"
+    if button is None:
+        log.warning("没找到玩家二维码按钮，跳过点击，假设你已经手动点过了")
+    else:
+        result["stage"] = "click_button"
         clicked = _click_control(button)
         if not clicked:
-            result["error"] = "找到按钮但点击失败"
+            result["error"] = "找到玩家二维码按钮但点击失败"
             return result
+    result["stage"] = "wait_card"
+    time.sleep(cfg.wait_after_button_click)
+    card = None
+    for i in range(cfg.retry_count + 1):
+        card = _find_latest_qr_card(win, timeout=cfg.card_wait_timeout)
+        if card is not None:
+            break
+        log.info(f"等链接卡片，retry {i+1}/{cfg.retry_count+1}")
+        if i < cfg.retry_count and button is not None:
+            log.info("重试点击玩家二维码按钮...")
+            _click_control(button)
+            time.sleep(cfg.wait_after_button_click)
+    if card is None:
+        log.warning("没等到链接卡片，跳过点击，假设二维码已经在屏幕上")
     else:
-        # 没找到按钮时，假设二维码已经显示在屏幕上，直接 OCR
-        log.warning("UI 没找到按钮，跳过点击阶段，直接尝试识别屏幕二维码")
-    time.sleep(cfg.wait_after_click)
+        result["stage"] = "click_card"
+        _click_control(card)
+    time.sleep(cfg.wait_after_card_click)
     time.sleep(cfg.wait_before_scan)
-    # ---- 5. 从屏幕识别二维码 ----
     result["stage"] = "ocr_screen"
-    link = _try_find_qr_link_on_screen(
-        region=cfg.qr_region,
-        attempts=3, interval=1.8,
-    )
+    link = _try_find_qr_link_on_screen(region=cfg.qr_region, attempts=4, interval=1.5)
     if link:
         result["ok"] = True
         result["link"] = link
         result["stage"] = "done"
         return result
-    result["error"] = "UI 点击成功但从屏幕没识别到二维码，请确认二维码已经弹出。"
-    # 即使失败也保存一张截图，让前端能直观看到现场
+    result["error"] = "UI 操作完成但从屏幕没识别到二维码，请确认微信内置浏览器已经弹出并显示二维码"
     try:
         img = _screenshot(cfg.qr_region)
         result["raw_png_base64"] = _save_png_base64(img)
@@ -257,7 +241,8 @@ def fetch_qr_code(cfg: Optional[FetchConfig] = None) -> Dict:
         log.warning(f"保存失败截图也出错：{e}")
     return result
 if __name__ == "__main__":
-    # 直接 python qr_fetcher.py 可以快速验证整条链路
     print("=== 手动测试：fetch_qr_code() ===")
     r = fetch_qr_code()
-    print(r)
+    import json
+    safe = {k: (v[:120] + "..." if isinstance(v, str) and len(v) > 120 else v) for k, v in r.items()}
+    print(json.dumps(safe, ensure_ascii=False, indent=2))
