@@ -48,6 +48,10 @@ try:
 except ImportError:
     CV2_OK = False
 try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
     import win32gui
 except ImportError:
     win32gui = None
@@ -248,7 +252,7 @@ def _get_window_rect(win) -> Optional[Tuple[int, int, int, int]]:
         return None
 
 
-def _wait_window_rect_stable(win, min_bottom=800, max_wait=3.0):
+def _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0):
     """
     ShowWindow 之后，最小化窗口展开到正常位置大概需要 100-300ms。
     这里循环读 rect 直到 bottom > min_bottom 或者超时。
@@ -281,11 +285,8 @@ def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
     if ctypes is not None:
         user32 = ctypes.windll.user32
         try:
-            user32.ShowWindow(hwnd, 9)   # SW_RESTORE
-            user32.ShowWindow(hwnd, 5)   # SW_SHOW
-            user32.ShowWindow(hwnd, 3)   # SW_MAXIMIZE  先最大化保证占满屏幕
-            user32.ShowWindow(hwnd, 5)   # SW_SHOW
-            log.info("[ACT]   user32.ShowWindow RESTORE/SHOW/MAX ✅")
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW only, do NOT change size
+            log.info("[ACT]   user32.ShowWindow(SW_SHOW=5) ✅")
         except Exception as e:
             log.warning(f"[ACT]   ShowWindow ❌ {e}")
         try:
@@ -298,7 +299,6 @@ def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
     # Step 2: uiautomation
     if auto is not None and hasattr(auto, "SW"):
         try:
-            win.ShowWindow(auto.SW.Restore)
             win.ShowWindow(auto.SW.Show)
         except Exception as e:
             log.info(f"[ACT]   uiautomation.ShowWindow ❌ {e}")
@@ -310,7 +310,7 @@ def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
             log.info(f"[ACT]   {fn_name} ❌ {e}")
 
     # Step 3: 等 rect 稳定
-    rect, dt = _wait_window_rect_stable(win, min_bottom=800, max_wait=3.0)
+    rect, dt = _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0)
     _log_all_top_windows("ACT_AFTER")
 
     if rect:
@@ -655,56 +655,40 @@ def _click_card(win, card) -> None:
 
 
 def _single_pass(win, button, pass_index, cfg) -> Dict:
-    out = {"ok": False, "link": None, "stage": f"outer_pass_{pass_index}_start",
-           "card_found": False, "card_clicked": False, "error": None}
-    log.info(f"======= _single_pass #{pass_index}/{cfg.max_outer_retries} =======")
-
-    out["stage"] = f"outer_pass_{pass_index}_click_button"
+    out = {""ok"": False, ""link"": None, ""stage"": f""outer_pass_{pass_index}_start"",
+           ""card_found"": False, ""card_clicked"": False, ""error"": None}
+    log.info(f""======= _single_pass #{pass_index}/{cfg.max_outer_retries} ======="")
+    out[""stage""] = f""outer_pass_{pass_index}_click_button""
     _click_qr_button(win, button)
-
-    out["stage"] = f"outer_pass_{pass_index}_wait_card"
-    card = None
-    for i in range(cfg.retry_count + 1):
-        log.info(f"[PASS{pass_index}] 等待卡片 第 {i+1}/{cfg.retry_count+1} ...")
-        card = _find_latest_qr_card(win, timeout=cfg.card_wait_timeout)
-        if card is not None:
-            break
-        if i < cfg.retry_count:
-            err = _detect_error_card(win)
-            if err:
-                log.warning(f"[PASS{pass_index}] 错误：{err}")
-            time.sleep(cfg.retry_interval)
-            _click_qr_button(win, button)
-
+    # 点一次按钮后，最多等 card_wait_timeout 秒（用户说可能要 20s 才出来）
+    out[""stage""] = f""outer_pass_{pass_index}_wait_card""
+    time.sleep(cfg.wait_after_button_click)
+    card = _find_latest_qr_card(win, timeout=cfg.card_wait_timeout)
     if card is None:
-        out["stage"] = f"outer_pass_{pass_index}_no_card"
+        out[""stage""] = f""outer_pass_{pass_index}_no_card""
         err_txt = _detect_error_card(win)
-        out["error"] = (f"疑似服务故障：{err_txt}" if err_txt else
-                        "没等到链接卡片（可能公众号返回失败 / 消息还没到达）")
+        out[""error""] = (f""疑似服务故障：{err_txt}"" if err_txt else
+                        f""点了玩家二维码后 {cfg.card_wait_timeout}s 内没出现二维码卡片"")
         return out
-
-    out["card_found"] = True
-    out["stage"] = f"outer_pass_{pass_index}_click_card"
+    out[""card_found""] = True
+    out[""stage""] = f""outer_pass_{pass_index}_click_card""
     _click_card(win, card)
-    out["card_clicked"] = True
-
-    log.info(f"[PASS{pass_index}] 睡 {cfg.wait_after_card_click}s 等内置浏览器加载 ...")
+    out[""card_clicked""] = True
+    log.info(f""[PASS{pass_index}] 点完卡片，睡 {cfg.wait_after_card_click}s 等内置浏览器加载 ..."")
     time.sleep(cfg.wait_after_card_click)
-    _save_screen("13_after_card_wait")
-    _log_all_top_windows("AFTER_CARD_WAIT")
-
-    out["stage"] = f"outer_pass_{pass_index}_ocr"
+    _save_screen(""13_after_card_wait"")
+    _log_all_top_windows(""AFTER_CARD_WAIT"")
+    out[""stage""] = f""outer_pass_{pass_index}_ocr""
     link = _try_find_qr_link_on_screen(attempts=6, interval=2.0)
     if link:
-        out["ok"] = True
-        out["link"] = link
-        out["stage"] = "done"
+        out[""ok""] = True
+        out[""link""] = link
+        out[""stage""] = ""done""
     else:
-        out["error"] = (out.get("error") or "屏幕没识别到二维码") + " - 可能卡在内置浏览器"
-        _save_screen("14_ocr_failed")
-        _log_all_top_windows("OCR_FAILED")
+        out[""error""] = (out.get(""error"") or ""屏幕没识别到二维码"") + "" - 可能卡在内置浏览器""
+        _save_screen(""14_ocr_failed"")
+        _log_all_top_windows(""OCR_FAILED"")
     return out
-
 
 # ====== 外部锁：Flask 入口和 fetch_qr_code 共用 ======
 _RUNNING_LOCK = threading.Lock()
