@@ -48,10 +48,6 @@ try:
 except ImportError:
     CV2_OK = False
 try:
-    import numpy as np
-except ImportError:
-    np = None
-try:
     import win32gui
 except ImportError:
     win32gui = None
@@ -185,12 +181,12 @@ ERROR_KEYWORDS = ("服务出现故障", "服务异常", "稍后再试", "公众�
 
 @dataclass
 class FetchConfig:
-    wait_after_button_click: float = 2.0
+    wait_after_button_click: float = 4.0
     wait_after_card_click: float = 10.0
     wait_before_scan: float = 2.5
     retry_count: int = 2
     retry_interval: float = 2.0
-    card_wait_timeout: float = 25.0
+    card_wait_timeout: float = 20.0
     qr_region: Optional[Tuple[int, int, int, int]] = None
     max_outer_retries: int = 5
     outer_retry_jitter: Tuple[float, float] = (5.0, 8.0)
@@ -252,7 +248,7 @@ def _get_window_rect(win) -> Optional[Tuple[int, int, int, int]]:
         return None
 
 
-def _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0):
+def _wait_window_rect_stable(win, min_bottom=800, max_wait=3.0):
     """
     ShowWindow 之后，最小化窗口展开到正常位置大概需要 100-300ms。
     这里循环读 rect 直到 bottom > min_bottom 或者超时。
@@ -286,26 +282,26 @@ def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
     if ctypes is not None:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
-        # 关键：先把前台线程切到本线程，否则 SetForegroundWindow 会被 Windows 忽略
         try:
             foreground_hwnd = user32.GetForegroundWindow()
             current_tid = kernel32.GetCurrentThreadId()
             foreground_tid = user32.GetWindowThreadProcessId(foreground_hwnd, 0)
+            attached = False
             if current_tid != foreground_tid:
-                user32.AttachThreadInput(current_tid, foreground_tid, True)
+                attached = bool(user32.AttachThreadInput(current_tid, foreground_tid, True))
         except Exception as e:
-            log.warning(f"[ACT]   AttachThreadInput prepare: {e}")
+            log.warning(f"[ACT] AttachThreadInput prepare: {e}")
+            attached = False
         try:
             user32.ShowWindow(hwnd, 5)  # SW_SHOW only — 绝不 SW_RESTORE / SW_MAXIMIZE
             user32.SetForegroundWindow(hwnd)
             user32.BringWindowToTop(hwnd)
-            log.info("[ACT]   ShowWindow(SW_SHOW) + SetForegroundWindow + BringWindowToTop ✅")
+            log.info("[ACT] ShowWindow(SW_SHOW) + SetForegroundWindow + BringWindowToTop ok")
         except Exception as e:
-            log.warning(f"[ACT]   ShowWindow/SetForeground fail: {e}")
+            log.warning(f"[ACT] ShowWindow/SetForeground fail: {e}")
         finally:
-            # 解绑
             try:
-                if current_tid != foreground_tid:
+                if attached:
                     user32.AttachThreadInput(current_tid, foreground_tid, False)
             except Exception:
                 pass
@@ -314,13 +310,13 @@ def _activate_window(win) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
         try:
             win.ShowWindow(auto.SW.Show)
         except Exception as e:
-            log.info(f"[ACT]   uiautomation.ShowWindow fail: {e}")
+            log.info(f"[ACT] uiautomation.ShowWindow fail: {e}")
     for fn_name, fn in [("SetActive", lambda: win.SetActive()),
                         ("SetFocus", lambda: win.SetFocus())]:
         try:
             fn()
         except Exception as e:
-            log.info(f"[ACT]   {fn_name} fail: {e}")
+            log.info(f"[ACT] {fn_name} fail: {e}")
 
     rect, dt = _wait_window_rect_stable(win, min_bottom=400, max_wait=3.0)
     _log_all_top_windows("ACT_AFTER")
@@ -663,25 +659,20 @@ def _click_card(win, card) -> None:
         return
     _save_screen("11_before_click_card")
 
-    # 微信卡片经常在中间点击不生效 — 尝试 3 个候选坐标（中心、上半、下半）
-    candidates = [
-        (cx, cy, "center"),
-        (cx, cy - int(rect_h * 0.25), "upper_quarter"),
-        (cx, cy + int(rect_h * 0.25), "lower_quarter"),
-    ]
-    # 先尝试 uiautomation 的原生 Click（底层 SendInput，更准）
-    tried_uia = False
     try:
         if hasattr(card, "Click"):
             log.info("[CARD_CLICK] card.Click() uia native")
             card.Click()
-            tried_uia = True
     except Exception as e:
         log.warning(f"[CARD_CLICK] card.Click() fail: {e}")
     time.sleep(0.6)
 
-    # 再补一次 pyautogui 中心单击（防止 uia 的 Click 没触发实际 UI）
     if pyautogui is not None:
+        candidates = [
+            (cx, cy, "center"),
+            (cx, cy - int(rect_h * 0.25), "upper_quarter"),
+            (cx, cy + int(rect_h * 0.25), "lower_quarter"),
+        ]
         for tx, ty, tname in candidates:
             try:
                 pyautogui.moveTo(tx, ty, duration=0.08)
@@ -698,40 +689,49 @@ def _click_card(win, card) -> None:
 
 
 def _single_pass(win, button, pass_index, cfg) -> Dict:
-    out = {""ok"": False, ""link"": None, ""stage"": f""outer_pass_{pass_index}_start"",
-           ""card_found"": False, ""card_clicked"": False, ""error"": None}
-    log.info(f""======= _single_pass #{pass_index}/{cfg.max_outer_retries} ======="")
-    out[""stage""] = f""outer_pass_{pass_index}_click_button""
+    out = {"ok": False, "link": None, "stage": f"outer_pass_{pass_index}_start",
+           "card_found": False, "card_clicked": False, "error": None}
+    log.info(f"======= _single_pass #{pass_index}/{cfg.max_outer_retries} =======")
+
+    out["stage"] = f"outer_pass_{pass_index}_click_button"
     _click_qr_button(win, button)
-    # 点一次按钮后，最多等 card_wait_timeout 秒（用户说可能要 20s 才出来）
-    out[""stage""] = f""outer_pass_{pass_index}_wait_card""
+
+    # 点一次按钮后，等 cfg.wait_after_button_click + cfg.card_wait_timeout 秒，期间不重复点按钮
+    out["stage"] = f"outer_pass_{pass_index}_wait_card"
     time.sleep(cfg.wait_after_button_click)
     card = _find_latest_qr_card(win, timeout=cfg.card_wait_timeout)
+
     if card is None:
-        out[""stage""] = f""outer_pass_{pass_index}_no_card""
+        out["stage"] = f"outer_pass_{pass_index}_no_card"
         err_txt = _detect_error_card(win)
-        out[""error""] = (f""疑似服务故障：{err_txt}"" if err_txt else
-                        f""点了玩家二维码后 {cfg.card_wait_timeout}s 内没出现二维码卡片"")
+        if err_txt:
+            out["error"] = f"疑似服务故障：{err_txt}"
+        else:
+            out["error"] = f"点了玩家二维码后 {cfg.card_wait_timeout}s 内没出现二维码卡片"
         return out
-    out[""card_found""] = True
-    out[""stage""] = f""outer_pass_{pass_index}_click_card""
+
+    out["card_found"] = True
+    out["stage"] = f"outer_pass_{pass_index}_click_card"
     _click_card(win, card)
-    out[""card_clicked""] = True
-    log.info(f""[PASS{pass_index}] 点完卡片，睡 {cfg.wait_after_card_click}s 等内置浏览器加载 ..."")
+    out["card_clicked"] = True
+
+    log.info(f"[PASS{pass_index}] 睡 {cfg.wait_after_card_click}s 等内置浏览器加载 ...")
     time.sleep(cfg.wait_after_card_click)
-    _save_screen(""13_after_card_wait"")
-    _log_all_top_windows(""AFTER_CARD_WAIT"")
-    out[""stage""] = f""outer_pass_{pass_index}_ocr""
+    _save_screen("13_after_card_wait")
+    _log_all_top_windows("AFTER_CARD_WAIT")
+
+    out["stage"] = f"outer_pass_{pass_index}_ocr"
     link = _try_find_qr_link_on_screen(attempts=6, interval=2.0)
     if link:
-        out[""ok""] = True
-        out[""link""] = link
-        out[""stage""] = ""done""
+        out["ok"] = True
+        out["link"] = link
+        out["stage"] = "done"
     else:
-        out[""error""] = (out.get(""error"") or ""屏幕没识别到二维码"") + "" - 可能卡在内置浏览器""
-        _save_screen(""14_ocr_failed"")
-        _log_all_top_windows(""OCR_FAILED"")
+        out["error"] = (out.get("error") or "屏幕没识别到二维码") + " - 可能卡在内置浏览器"
+        _save_screen("14_ocr_failed")
+        _log_all_top_windows("OCR_FAILED")
     return out
+
 
 # ====== 外部锁：Flask 入口和 fetch_qr_code 共用 ======
 _RUNNING_LOCK = threading.Lock()
