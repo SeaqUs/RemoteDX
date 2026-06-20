@@ -96,12 +96,9 @@ def _parse_region(raw) -> Optional[tuple]:
 @app.before_request
 def _before():
     """每个请求都打日志。"""
-    access.info(
-        f"[{request.method}] {request.path} "
-        f"from={request.remote_addr} "
-        f"ua={(request.headers.get('User-Agent','')[:50]} "
-        f"ct={request.headers.get('Content-Type','')}"
-    )
+    ua = (request.headers.get('User-Agent', '') or '')[:50]
+    ct = request.headers.get('Content-Type', '') or ''
+    access.info(f"[{request.method}] {request.path} from={request.remote_addr} ua={ua} ct={ct}")
 
 
 @app.route("/api/get_qr", methods=["POST", "OPTIONS"])
