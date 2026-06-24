@@ -48,6 +48,11 @@ try:
 except ImportError:
     CV2_OK = False
 try:
+    import numpy as np
+    NP_OK = True
+except ImportError:
+    NP_OK = False
+try:
     import win32gui
 except ImportError:
     win32gui = None
