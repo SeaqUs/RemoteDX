@@ -4,3 +4,14 @@ __pycache__/
 .env
 .idea/
 .vscode/
+# 运行时生成的日志、截图、comtypes 包装模块
+logs/
+comtypes_gen/
+@AutomationLog.txt
+*.bak
+# 临时安装/测试输出
+pip_*.txt
+pip_check.txt
+_api_test*.py
+_debug_qr.py
+run_test.py

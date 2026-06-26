@@ -20,6 +20,23 @@ import logging, io, base64, time, random, os, sys, traceback, datetime, threadin
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 
+# 把 comtypes 生成文件放到项目目录，避免 Flask 后台线程无权限写 site-packages。
+# 同时把项目目录插入到 comtypes.gen.__path__ 最前面，确保优先使用项目内生成的模块，
+# 否则若系统 site-packages 里存在旧版生成的模块，会被优先加载并抛出
+# "Typelib different than module" ImportError。
+_COMTYPES_GEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comtypes_gen")
+try:
+    os.makedirs(_COMTYPES_GEN_DIR, exist_ok=True)
+    import comtypes
+    import comtypes.client
+    import comtypes.gen as _comtypes_gen
+    comtypes.gen_dir = _COMTYPES_GEN_DIR
+    comtypes.client.gen_dir = _COMTYPES_GEN_DIR
+    if _COMTYPES_GEN_DIR not in _comtypes_gen.__path__:
+        _comtypes_gen.__path__.insert(0, _COMTYPES_GEN_DIR)
+except Exception:
+    pass
+
 try:
     import uiautomation as auto
 except ImportError:
@@ -56,6 +73,12 @@ try:
     import win32gui
 except ImportError:
     win32gui = None
+try:
+    from pyzbar.pyzbar import decode as _pyzbar_decode
+    PYZBAR_OK = True
+except ImportError:
+    _pyzbar_decode = None
+    PYZBAR_OK = False
 
 # ====== 日志系统 ======
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -65,7 +88,43 @@ _LOG_FILE = os.path.join(_LOG_DIR, f"qr_{_TS}.log")
 _FILE_HANDLER = logging.FileHandler(_LOG_FILE, encoding="utf-8")
 _FILE_HANDLER.setFormatter(logging.Formatter(
     "[%(asctime)s] %(levelname)s %(name)s | %(message)s", datefmt="%H:%M:%S"))
-_CONSOLE_HANDLER = logging.StreamHandler(sys.stdout)
+# 给 console handler 加一层转码包装，避免 PowerShell gbk 输出特殊符号时抛 UnicodeEncodeError。
+# 第一次直接输出；失败时把格式化后的消息按目标编码过滤掉无法显示的字符再写。
+class _SafeStreamHandler(logging.StreamHandler):
+    """安全控制台日志 Handler：先直接输出；遇到 UnicodeEncodeError 时按目标编码过滤后再写。
+
+    注意：不重写 super().emit()，因为 logging.StreamHandler.emit 内部捕获异常后会自行调用
+    handleError() 并打印 "Logging error"，产生刷屏。这里直接操作 self.stream，把 gbk 无法显示
+    的字符安全过滤掉。
+    """
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.stream.write(msg + self.terminator)
+            self.flush()
+            return
+        except UnicodeEncodeError:
+            pass
+        except Exception:
+            self.handleError(record)
+            return
+        # 安全回退：按当前流能接受的编码做 ignore 过滤（常见为 gbk / utf-8）
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = str(record.getMessage())
+        enc = getattr(self.stream, "encoding", None) or sys.stdout.encoding or "gbk"
+        try:
+            safe = msg.encode(enc, "ignore").decode(enc, "ignore")
+        except Exception:
+            safe = msg.encode("ascii", "ignore").decode("ascii", "ignore")
+        try:
+            self.stream.write(safe + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+_CONSOLE_HANDLER = _SafeStreamHandler(sys.stdout)
 _CONSOLE_HANDLER.setFormatter(logging.Formatter(
     "[%(asctime)s] %(levelname)s %(name)s | %(message)s", datefmt="%H:%M:%S"))
 logging.basicConfig(level=logging.DEBUG, handlers=[_FILE_HANDLER, _CONSOLE_HANDLER])
@@ -91,10 +150,10 @@ def _save_screen(step_label: str) -> Optional[str]:
     try:
         img = ImageGrab.grab()
         img.save(path)
-        log.info(f"📸 截图 step#{step} => {path}  size={img.size}")
+        log.info(f"[SCREEN] 截图 step#{step} => {path}  size={img.size}")
         return path
     except Exception as e:
-        log.warning(f"📸 截图 step#{step} 失败：{e}")
+        log.warning(f"[SCREEN] 截图 step#{step} 失败：{e}")
         return None
 
 
@@ -106,8 +165,10 @@ def _dump_all_top_windows() -> List[Tuple[int, str, str, int, int, int, int]]:
         if win32gui.IsWindowVisible(hwnd):
             title = win32gui.GetWindowText(hwnd)
             cls = win32gui.GetClassName(hwnd)
-            if title or cls:
-                l, t, r, b = win32gui.GetWindowRect(hwnd)
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            width, height = r - l, b - t
+            # 过滤掉坐标在 (-32000, -32000) 的最小化占位窗口（wx/QQ/MuMu 托盘图标都会占可见位）
+            if width > 0 and height > 0 and l > -10000 and t > -10000:
                 wins.append((hwnd, title, cls, l, t, r, b))
     try:
         win32gui.EnumWindows(_cb, None)
@@ -160,7 +221,8 @@ def _log_wechat_subtree(win, prefix: str = "WECHAT_TREE"):
                 rect = f"({r.left},{r.top},{r.right},{r.bottom})"
             except Exception:
                 rect = "?"
-            lines.append(f"{indent}⌜Name={name[:40]:<40} ClassName={cls:<40} Type={ctn:<18} Rect={rect}")
+            # 用纯 ASCII 树形标记，避免 PowerShell gbk 控制台输出特殊符号时报错
+            lines.append(f"{indent}+-- Name={name[:40]:<40} ClassName={cls:<40} Type={ctn:<18} Rect={rect}")
             for ch in node.GetChildren():
                 _dump(ch, depth + 1, max_depth, lines)
         except Exception as e:
@@ -207,17 +269,17 @@ def _co_init():
     if pythoncom is not None:
         try:
             pythoncom.CoInitialize()
-            log.info("[COM] pythoncom.CoInitialize ✅")
+            log.info("[COM] pythoncom.CoInitialize OK")
             ok = True
         except Exception as e:
-            log.warning(f"[COM] pythoncom.CoInitialize ❌ {e}")
+            log.warning(f"[COM] pythoncom.CoInitialize FAIL {e}")
     if not ok and auto is not None and hasattr(auto, "InitializeUIAutomationInCurrentThread"):
         try:
             auto.InitializeUIAutomationInCurrentThread()
-            log.info("[COM] InitializeUIAutomationInCurrentThread ✅")
+            log.info("[COM] InitializeUIAutomationInCurrentThread OK")
             ok = True
         except Exception as e:
-            log.warning(f"[COM] InitializeUIAutomationInCurrentThread ❌ {e}")
+            log.warning(f"[COM] InitializeUIAutomationInCurrentThread FAIL {e}")
     if not ok:
         log.error("[COM] 所有 CoInitialize 策略失败！uiautomation 可能不可用")
     return ok
@@ -228,18 +290,26 @@ def _get_wechat_window():
     if auto is None:
         log.error("uiautomation 未安装")
         return None
-    log.info("[WIN] 按 Name='微信' 查窗口...")
-    for name, kwargs in [
-        (WECHAT_WINDOW_NAME, {"Name": WECHAT_WINDOW_NAME}),
-        ("mmui::MainWindow", {"ClassName": "mmui::MainWindow"}),
-    ]:
-        try:
-            win = auto.WindowControl(searchDepth=1, **kwargs)
-            win.GetRuntimeId()
-            log.info(f"[WIN] ✅ 找到 Name={win.Name} ClassName={win.ClassName} Handle={win.NativeWindowHandle}")
-            return win
-        except Exception as e:
-            log.info(f"[WIN] 按 {name} 没找到：{type(e).__name__}")
+    # 新进程首次调用 uiautomation 时，comtypes 可能要现场生成 UIAutomationCore 的包装模块，
+    # 第一次 WindowControl 会抛 ImportError；生成完成后重试即可。
+    for attempt in range(3):
+        log.info(f"[WIN] 按 Name='微信' 查窗口... (attempt {attempt + 1})")
+        for name, kwargs in [
+            (WECHAT_WINDOW_NAME, {"Name": WECHAT_WINDOW_NAME}),
+            ("mmui::MainWindow", {"ClassName": "mmui::MainWindow"}),
+        ]:
+            try:
+                win = auto.WindowControl(searchDepth=1, **kwargs)
+                win.GetRuntimeId()
+                log.info(f"[WIN] OK 找到 Name={win.Name} ClassName={win.ClassName} Handle={win.NativeWindowHandle}")
+                return win
+            except ImportError as e:
+                log.warning(f"[WIN] 按 {name} 没找到：ImportError（comtypes 生成中）{e}")
+            except Exception as e:
+                log.info(f"[WIN] 按 {name} 没找到：{type(e).__name__}")
+        if attempt < 2:
+            log.info("[WIN] comtypes 生成未完成，等待 1.5s 后重试...")
+            time.sleep(1.5)
     _log_all_top_windows("SEARCH_WIN_POST")
     return None
 
@@ -341,14 +411,14 @@ def _py_click(cx, cy, label="click"):
     try:
         pyautogui.moveTo(cx, cy, duration=0.12)
     except Exception as e:
-        log.warning(f"[{label}] moveTo ❌ {e}")
+        log.warning(f"[{label}] moveTo FAIL {e}")
         return
     time.sleep(0.15)
     try:
         pyautogui.click(cx, cy)
-        log.info(f"[{label}] ✅ click @({cx},{cy})")
+        log.info(f"[{label}] OK click @({cx},{cy})")
     except Exception as e:
-        log.warning(f"[{label}] click ❌ {e}")
+        log.warning(f"[{label}] click FAIL {e}")
 
 
 def _three_step_click(cx, cy, label, sleep_between=2.0):
@@ -359,22 +429,22 @@ def _three_step_click(cx, cy, label, sleep_between=2.0):
     try:
         pyautogui.moveTo(cx, cy, duration=0.12)
     except Exception as e:
-        log.warning(f"[3STEP:{label}] moveTo ❌ {e}")
+        log.warning(f"[3STEP:{label}] moveTo FAIL {e}")
         return
     time.sleep(0.15)
 
     try:
         pyautogui.click(cx, cy)
-        log.info(f"[3STEP:{label}] #1 click ✅")
+        log.info(f"[3STEP:{label}] #1 click OK")
     except Exception as e:
-        log.warning(f"[3STEP:{label}] #1 click ❌ {e}")
+        log.warning(f"[3STEP:{label}] #1 click FAIL {e}")
     time.sleep(sleep_between)
 
     try:
         pyautogui.doubleClick(cx, cy)
-        log.info(f"[3STEP:{label}] #2 doubleClick ✅")
+        log.info(f"[3STEP:{label}] #2 doubleClick OK")
     except Exception as e:
-        log.warning(f"[3STEP:{label}] #2 doubleClick ❌ {e}")
+        log.warning(f"[3STEP:{label}] #2 doubleClick FAIL {e}")
     time.sleep(0.3)
 
 
@@ -385,16 +455,16 @@ def _click_control_alt(ctrl, label="ctrl"):
         return False
     try:
         ctrl.GetInvokePattern().Invoke()
-        log.info(f"[ALT_CLICK:{label}] InvokePattern ✅")
+        log.info(f"[ALT_CLICK:{label}] InvokePattern OK")
         return True
     except Exception as e:
-        log.info(f"[ALT_CLICK:{label}] Invoke ❌ {e}")
+        log.info(f"[ALT_CLICK:{label}] Invoke FAIL {e}")
     try:
         ctrl.Click()
-        log.info(f"[ALT_CLICK:{label}] .Click() ✅")
+        log.info(f"[ALT_CLICK:{label}] .Click() OK")
         return True
     except Exception as e:
-        log.info(f"[ALT_CLICK:{label}] .Click ❌ {e}")
+        log.info(f"[ALT_CLICK:{label}] .Click FAIL {e}")
     return False
 
 
@@ -412,7 +482,7 @@ def _ensure_biz_menu_view(win, win_rect, cfg: FetchConfig):
         try:
             if "BizMenuView" in (getattr(c, "ClassName", "") or ""):
                 r = c.BoundingRectangle
-                log.info(f"[BIZ] ✅ BizMenuView 已可见 rect=({r.left},{r.top},{r.right},{r.bottom})")
+                log.info(f"[BIZ] OK BizMenuView 已可见 rect=({r.left},{r.top},{r.right},{r.bottom})")
                 _save_screen("02_biz_menu_already_visible")
                 return True
         except Exception:
@@ -438,13 +508,13 @@ def _ensure_biz_menu_view(win, win_rect, cfg: FetchConfig):
         try:
             if "BizMenuView" in (getattr(c, "ClassName", "") or ""):
                 r = c.BoundingRectangle
-                log.info(f"[BIZ] ✅ 展开后 BizMenuView 出现 rect=({r.left},{r.top},{r.right},{r.bottom})")
+                log.info(f"[BIZ] OK 展开后 BizMenuView 出现 rect=({r.left},{r.top},{r.right},{r.bottom})")
                 _save_screen("04_biz_menu_opened")
                 return True
         except Exception:
             continue
 
-    log.warning("[BIZ] ❌ 点了 More 但 BizMenuView 仍不存在")
+    log.warning("[BIZ] FAIL 点了 More 但 BizMenuView 仍不存在")
     _log_wechat_subtree(win, prefix="BIZ_FAIL_TREE")
     _save_screen("05_no_biz_menu")
     return False
@@ -466,7 +536,7 @@ def _find_qr_button(win, require_biz_menu=True):
                         sc = getattr(sub, "ClassName", "") or ""
                         if nm == QR_BUTTON_NAME:
                             r = sub.BoundingRectangle
-                            log.info(f"[BTN] ✅ BizMenuView 内找到：ClassName={sc} rect=({r.left},{r.top},{r.right},{r.bottom})")
+                            log.info(f"[BTN] OK BizMenuView 内找到：ClassName={sc} rect=({r.left},{r.top},{r.right},{r.bottom})")
                             return sub
                     except Exception:
                         continue
@@ -494,10 +564,10 @@ def _find_qr_button(win, require_biz_menu=True):
             sc = getattr(c, "ClassName", "") or ""
             return 0 if ("Button" in sc or "XButton" in sc) else 1
         candidates.sort(key=_score)
-        log.info(f"[BTN] ✅ 兜底选中（候选 {len(candidates)} 个）")
+        log.info(f"[BTN] OK 兜底选中（候选 {len(candidates)} 个）")
         return candidates[0]
 
-    log.warning("[BTN] ❌ 整个 UIA 树都没有 玩家二维码")
+    log.warning("[BTN] FAIL 整个 UIA 树都没有 玩家二维码")
     _log_wechat_subtree(win, prefix="BTN_FAIL_TREE")
     _save_screen("06_no_qr_button")
     return None
@@ -526,7 +596,7 @@ def _find_latest_qr_card(win, timeout=15.0):
         if candidates:
             latest = max(candidates, key=lambda t: (t[1].bottom if t[1] else 0))
             c, r = latest
-            log.info(f"[CARD] ✅ {len(candidates)} 张候选，最新一张：Name={getattr(c,'Name','')[:80]} rect=({r.left},{r.top},{r.right},{r.bottom})")
+            log.info(f"[CARD] OK {len(candidates)} 张候选，最新一张：Name={getattr(c,'Name','')[:80]} rect=({r.left},{r.top},{r.right},{r.bottom})")
             for ci, ri in candidates:
                 log.info(f"[CARD]   候选：Name={getattr(ci,'Name','')[:50]} rect=({ri.left},{ri.top},{ri.right},{ri.bottom})")
             return c
@@ -536,7 +606,7 @@ def _find_latest_qr_card(win, timeout=15.0):
             if attempt % 15 == 0:
                 _log_wechat_subtree(win, prefix=f"CARD_WAIT_{attempt}")
         time.sleep(1)
-    log.warning(f"[CARD] ❌ 等了 {timeout}s 没找到任何卡片")
+    log.warning(f"[CARD] FAIL 等了 {timeout}s 没找到任何卡片")
     _log_wechat_subtree(win, prefix="CARD_TIMEOUT")
     _save_screen("07_no_card_after_timeout")
     return None
@@ -560,6 +630,7 @@ def _pil_to_cv2(pil_img):
 
 
 def _decode_qr_image(pil_img) -> Tuple[Optional[str], Optional[str]]:
+    """用 OpenCV QRCodeDetector + pyzbar 对一张 PIL 图做多种预处理/放大尝试。"""
     if not CV2_OK:
         return None, None
     try:
@@ -570,7 +641,9 @@ def _decode_qr_image(pil_img) -> Tuple[Optional[str], Optional[str]]:
                                        cv2.THRESH_BINARY, 11, 2)
         det = cv2.QRCodeDetector()
         strategies = [(bgr, "bgr"), (gray, "gray"), (clahe, "clahe"), (thresh, "thresh")]
-        for scale in [2, 3, 4, 6, 8, 10, 12]:
+        # 聊天卡片里的二维码通常很小，需要放大识别；全屏截图放大倍数过高会很慢，
+        # 这里放到 16x，调用方应优先裁剪卡片区域后再传进来。
+        for scale in [2, 3, 4, 6, 8, 10, 12, 16]:
             h, w = gray.shape
             big = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
             strategies.append((big, f"gray x{scale}"))
@@ -579,27 +652,68 @@ def _decode_qr_image(pil_img) -> Tuple[Optional[str], Optional[str]]:
             try:
                 link, pts, straight = det.detectAndDecode(img)
             except Exception as e:
-                log.debug(f"[QR] [{idx}/{total}] {label} ❌ {e}")
+                log.debug(f"[QR] [{idx}/{total}] {label} FAIL {e}")
                 continue
             if link:
-                log.info(f"[QR] ✅ [{idx}/{total}] {label} => {link}")
+                log.info(f"[QR] OK [{idx}/{total}] {label} => {link}")
                 return link, label
             log.debug(f"[QR] [{idx}/{total}] {label} => (empty)")
-        log.info(f"[QR] ❌ 全部 {total} 种策略都没识别到二维码")
+
+        # pyzbar 兜底：对同样的策略再扫一次
+        if PYZBAR_OK and _pyzbar_decode is not None:
+            for idx, (img, label) in enumerate(strategies, 1):
+                try:
+                    for d in _pyzbar_decode(img):
+                        data = getattr(d, "data", None)
+                        if data:
+                            link = data.decode("utf-8", errors="ignore") if isinstance(data, bytes) else str(data)
+                            log.info(f"[QR] OK pyzbar [{idx}/{total}] {label} => {link}")
+                            return link, f"pyzbar {label}"
+                except Exception as e:
+                    log.debug(f"[QR] pyzbar [{idx}/{total}] {label} FAIL {e}")
+
+        log.info(f"[QR] FAIL 全部 {total} 种策略都没识别到二维码")
     except Exception as e:
-        log.warning(f"[QR] ❌ cv2 异常：{type(e).__name__}: {e}")
+        log.warning(f"[QR] FAIL cv2 异常：{type(e).__name__}: {e}")
     return None, None
 
 
-def _try_find_qr_link_on_screen(attempts=6, interval=2.0):
-    log.info(f"[QR] 循环截图+解码 attempts={attempts} interval={interval}s")
+def _decode_qr_from_region(region: Tuple[int, int, int, int], label: str = "region") -> Optional[str]:
+    """截图指定区域并尝试识别二维码。"""
+    log.info(f"[QR] 从区域 {region} 识别二维码 ({label})")
+    try:
+        img = _screenshot(region, label=f"qr_region_{label}")
+        link, hit = _decode_qr_image(img)
+        if link:
+            log.info(f"[QR] 区域 {label} 识别成功：{link}")
+            return link
+    except Exception as e:
+        log.warning(f"[QR] 区域 {label} 识别异常：{e}")
+    return None
+
+
+def _try_decode_card_qr(card) -> Optional[str]:
+    """找到聊天卡片后，直接裁剪卡片区域识别二维码，不依赖内置浏览器加载。"""
+    try:
+        r = card.BoundingRectangle
+        region = (r.left, r.top, r.right, r.bottom)
+    except Exception as e:
+        log.warning(f"[QR_CARD] 读卡片 rect 失败：{e}")
+        return None
+    return _decode_qr_from_region(region, label="card")
+
+
+def _try_find_qr_link_on_screen(cfg: FetchConfig, attempts=6, interval=2.0):
+    """按 cfg.qr_region 裁剪（未指定则全屏），循环截图识别二维码。"""
+    region = cfg.qr_region
+    log.info(f"[QR] 循环截图+解码 attempts={attempts} interval={interval}s region={region}")
     for i in range(attempts):
         log.info(f"[QR] --- 尝试 {i+1}/{attempts} ---")
         try:
-            img = _screenshot(None, label=f"qr_attempt_{i+1}")
+            img = _screenshot(region, label=f"qr_attempt_{i+1}")
             link, hit_label = _decode_qr_image(img)
             if link:
-                log.info(f"[QR] ✅ 第 {i+1} 次识别成功！link={link}")
+                log.info(f"[QR] OK 第 {i+1} 次识别成功！link={link}")
                 _save_screen(f"08_QR_OK_attempt{i+1}")
                 return link
         except Exception as e:
@@ -641,7 +755,7 @@ def _click_qr_button(win, button) -> bool:
         cy = int((r.top + r.bottom) / 2)
         log.info(f"[BTN_CLICK] rect=({r.left},{r.top},{r.right},{r.bottom}) center=({cx},{cy})")
     except Exception as e:
-        log.warning(f"[BTN_CLICK] BoundingRectangle ❌ {e}")
+        log.warning(f"[BTN_CLICK] BoundingRectangle FAIL {e}")
         return False
 
     _save_screen("09_before_click_qr_button")
@@ -716,6 +830,21 @@ def _single_pass(win, button, pass_index, cfg) -> Dict:
         return out
 
     out["card_found"] = True
+
+    # 优先直接裁剪聊天卡片区域识别二维码：卡片里已经包含登录二维码，
+    # 这样即使内置浏览器打不开/报服务故障也能拿到链接。
+    out["stage"] = f"outer_pass_{pass_index}_decode_card_qr"
+    link = _try_decode_card_qr(card)
+    if link:
+        out["ok"] = True
+        out["link"] = link
+        out["stage"] = "done"
+        out["card_clicked"] = True  # 未真正点击卡片，但 UI 历史里标记为已定位
+        _save_screen(f"08_QR_OK_card_attempt{pass_index}")
+        log.info(f"[PASS{pass_index}] 卡片区域直接识别成功")
+        return out
+
+    # 兜底：点击卡片，用内置浏览器打开后再识别全屏/指定区域二维码
     out["stage"] = f"outer_pass_{pass_index}_click_card"
     _click_card(win, card)
     out["card_clicked"] = True
@@ -726,7 +855,7 @@ def _single_pass(win, button, pass_index, cfg) -> Dict:
     _log_all_top_windows("AFTER_CARD_WAIT")
 
     out["stage"] = f"outer_pass_{pass_index}_ocr"
-    link = _try_find_qr_link_on_screen(attempts=6, interval=2.0)
+    link = _try_find_qr_link_on_screen(cfg, attempts=6, interval=2.0)
     if link:
         out["ok"] = True
         out["link"] = link
@@ -763,12 +892,12 @@ def fetch_qr_code(cfg=None) -> Dict:
     """主流程。"""
     cfg = cfg or FetchConfig()
     log.info("=" * 80)
-    log.info(f"🚀 fetch_qr_code cfg={cfg}")
-    log.info(f"📝 日志文件: {_LOG_FILE}")
+    log.info(f"[START] fetch_qr_code cfg={cfg}")
+    log.info(f"[START] 日志文件: {_LOG_FILE}")
 
     # 防重入：若 Flask 已经在跑另一个 fetch_qr_code，这里阻塞等它结束
     if not try_borrow_lock():
-        log.warning("🚨 已经有一个 fetch_qr_code 在跑，新的请求将直接退出并返回 error")
+        log.warning("[START] FAIL 已经有一个 fetch_qr_code 在跑，新的请求将直接退出并返回 error")
         return {"ok": False, "error": "已有任务在执行，请等待完成后再点一次",
                 "stage": "running_already", "log_file": _LOG_FILE, "outer_attempts": 0}
 
@@ -853,7 +982,7 @@ def fetch_qr_code(cfg=None) -> Dict:
                 result["stage"] = "done"
                 result["note"] = f"成功（第 {pass_index}/{cfg.max_outer_retries} 次）"
                 _save_screen("15_SUCCESS_QR")
-                log.info(f"🎉 最终 link = {one['link']}")
+                log.info(f"[SUCCESS] 最终 link = {one['link']}")
                 return result
 
             jitter = random.uniform(*cfg.outer_retry_jitter)
@@ -876,7 +1005,7 @@ def fetch_qr_code(cfg=None) -> Dict:
             _save_screen("16_FAIL_FINAL_FULLSCREEN")
         except Exception as e:
             log.warning(f"保存失败截图也出错：{e}")
-        log.error(f"🚨 全部 {cfg.max_outer_retries} 次失败。最终错误：{final}")
+        log.error(f"[FINAL] FAIL 全部 {cfg.max_outer_retries} 次失败。最终错误：{final}")
 
     except Exception as e:
         log.exception(f"fetch_qr_code 抛异常：{type(e).__name__}: {e}")

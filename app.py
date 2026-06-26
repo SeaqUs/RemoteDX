@@ -1,13 +1,45 @@
 """app.py - RemoteDX Flask HTTP 服务"""
-import logging, threading, time
+import logging, sys, threading, time
 from typing import Dict, Optional
 from flask import Flask, jsonify, request, Response
 from qr_fetcher import fetch_qr_code, FetchConfig
 from qr_utils import generate_qr_base64
 
 app = Flask(__name__)
+
+# 给 console handler 加一层转码包装，避免 PowerShell gbk 输出特殊符号时抛 UnicodeEncodeError。
+# 第一次直接输出；失败时把格式化后的消息按目标编码过滤掉无法显示的字符再写。
+class _SafeStreamHandler(logging.StreamHandler):
+    """安全控制台日志 Handler：先直接输出；遇到 UnicodeEncodeError 时按目标编码过滤后再写。"""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.stream.write(msg + self.terminator)
+            self.flush()
+            return
+        except UnicodeEncodeError:
+            pass
+        except Exception:
+            self.handleError(record)
+            return
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = str(record.getMessage())
+        enc = getattr(self.stream, "encoding", None) or sys.stdout.encoding or "gbk"
+        try:
+            safe = msg.encode(enc, "ignore").decode(enc, "ignore")
+        except Exception:
+            safe = msg.encode("ascii", "ignore").decode("ascii", "ignore")
+        try:
+            self.stream.write(safe + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 logging.basicConfig(level=logging.INFO,
-                    format="[%(asctime)s] %(levelname)s %(name)s | %(message)s")
+                    format="[%(asctime)s] %(levelname)s %(name)s | %(message)s",
+                    handlers=[_SafeStreamHandler(sys.stdout)])
 log = logging.getLogger("app")
 
 _state_lock = threading.Lock()
@@ -33,14 +65,24 @@ STATE = {
 def _run_in_background(cfg: FetchConfig) -> None:
     """后台执行一次扫码任务，把 fetch_qr_code 返回的所有字段都塞回 STATE。"""
     with _state_lock:
-        STATE["running"] = True
+        # 先清空所有字段，再把 running 置为 True，否则 loop 会把 running 覆盖成 None
         for k in list(STATE.keys()):
             STATE[k] = None
+        STATE["running"] = True
         STATE["started_at"] = time.time()
     try:
         result = fetch_qr_code(cfg)
         link = result.get("link")
-        qr_png_b64 = generate_qr_base64(link, box_size=12, border=4) if link else None
+        log.info(f"[BG] fetch_qr_code 完成 link={bool(link)} ok={result.get('ok')} stage={result.get('stage')}")
+        if link:
+            try:
+                qr_png_b64 = generate_qr_base64(link, box_size=12, border=4)
+                log.info(f"[BG] generate_qr_base64 返回长度={len(qr_png_b64) if qr_png_b64 else 0}")
+            except Exception as qe:
+                log.exception("[BG] generate_qr_base64 失败")
+                qr_png_b64 = None
+        else:
+            qr_png_b64 = None
         with _state_lock:
             STATE["running"] = False
             STATE["finished_at"] = time.time()
@@ -190,6 +232,9 @@ INDEX_HTML = (
     "用手机微信扫这张码 / 点上方链接</div></div>"
     "<script>"
     "const $=id=>document.getElementById(id);"
+    "const goBtn=$('go'),resetBtn=$('reset'),stage=$('stage'),err=$('err'),"
+    "passes=$('passes'),qrbox=$('qrbox'),link=$('link'),qrcanvas=$('qrcanvas'),"
+    "region=$('region'),retries=$('retries');"
     "const STAGE_MAP={"
     "'locate_window':'寻找微信窗口...',"
     "'activate':'激活微信窗口...',"
@@ -222,18 +267,18 @@ INDEX_HTML = (
     "if(finished!=null&&total!=null&&!passes[passes.length-1].ok){"
     "html+=`<div class=\"warn\" style=\"margin-top:6px;\">已跑 ${finished}/${total} 次，均未成功</div>`;}"
     "passes.innerHTML=html;}"
-    "async function go(){go.disabled=true;reset.disabled=true;"
+    "async function doGo(){goBtn.disabled=true;resetBtn.disabled=true;"
     "stage.textContent='已触发，后台执行中...';err.textContent='';passes.innerHTML='';"
     "qrbox.style.display='none';"
     "try{const body={};const r=region.value.trim();if(r)body.qr_region=r;"
     "const n=parseInt(retries.value,10);if(n>0)body.max_outer_retries=n;"
     "const resp=await fetch('/api/get_qr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
-    "const j=await resp.json();if(!j.ok){stage.textContent='触发失败';err.textContent=j.error||'';}else poll();}"
+    "const j=await resp.json();if(!j.ok){stage.textContent='触发失败';err.textContent=j.error||'';doReset();}else poll();}"
     "catch(e){stage.textContent='请求失败';err.textContent=String(e);"
-    "go.disabled=false;reset.disabled=false;}}"
-    "async function reset(){await fetch('/api/reset',{method:'POST'});"
+    "goBtn.disabled=false;resetBtn.disabled=false;}}"
+    "async function doReset(){await fetch('/api/reset',{method:'POST'});"
     "stage.textContent='等待触发...';err.textContent='';passes.innerHTML='';"
-    "qrbox.style.display='none';}"
+    "qrbox.style.display='none';goBtn.disabled=false;resetBtn.disabled=false;}"
     "async function poll(){let last=null;"
     "while(true){const r=await fetch('/api/qr_result').then(x=>x.json());"
     "if(r.stage&&r.stage!==last){last=r.stage;"
@@ -257,9 +302,9 @@ INDEX_HTML = (
     "c.getContext('2d').drawImage(img,0,0);"
     "status.appendChild(c);};"
     "img.src='data:image/png;base64,'+r.raw_png_base64;}}"
-    "go.disabled=false;reset.disabled=false;return;}"
+    "goBtn.disabled=false;resetBtn.disabled=false;return;}"
     "await new Promise(x=>setTimeout(x,1500));}}"
-    "go.onclick=go;reset.onclick=reset;"
+    "goBtn.onclick=doGo;resetBtn.onclick=doReset;"
     "</script></body></html>"
 )
 
